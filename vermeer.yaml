@@ -1,0 +1,43 @@
+# Minimal conda environment to run Vermeer.
+#
+# Covers the core paths: the tutorial.ipynb virtual-staining demo, the
+# Vermeer GPT/VQ model code, training (train_ca.py) and image tokenization
+# (extract_codes_ca.py), plus the data-preparation, ESM-C embedding,
+# evaluation, and benchmarking scripts.
+#
+# Note: the intra-nuclear-proportion eval defaults to StarDist masks, but
+# StarDist (+ TensorFlow) is intentionally left out. The script automatically
+# falls back to Otsu masks (scikit-image) when StarDist is unavailable, or run
+# it explicitly with `--mask_method otsu`.
+
+name: vermeer
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - numpy
+  - scipy
+  - matplotlib-base
+  - pillow
+  - h5py
+  - tqdm
+  - wandb
+  # to run tutorial.ipynb
+  - jupyter
+  - ipykernel
+  # data preparation / preprocessing
+  - biopython
+  - seaborn
+  - tifffile
+  # evaluation metrics
+  - torchmetrics
+  # Otsu nuclear masks (evaluate_intra_nuclear_prop.py: skimage.filters.threshold_otsu)
+  - scikit-image
+  # benchmarking (cv2)
+  - opencv
+  - pip:
+      - torch==2.10.0+cu130
+      - torchvision==0.25.0+cu130
+      # ESM-C 600M embeddings (dataset/prepare_protein_prefix.py: `from esm.models.esmc import ESMC`)
+      - esm
