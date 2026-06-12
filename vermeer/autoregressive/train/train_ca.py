@@ -27,6 +27,8 @@ import math
 import random
 import numpy as np
 
+import sys
+
 from utils.logger import create_logger
 from utils.distributed import init_distributed_mode
 from utils.ema import update_ema, requires_grad
@@ -307,12 +309,6 @@ def main(args):
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
-
-        time_record = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
-        cloud_results_dir = f"{args.cloud_save_path}/{time_record}"
-        cloud_checkpoint_dir = f"{cloud_results_dir}/{experiment_folder_name}/checkpoints"
-        os.makedirs(cloud_checkpoint_dir, exist_ok=True)
-        logger.info(f"Experiment directory created in cloud at {cloud_checkpoint_dir}")
         
         # Initialize wandb
         if args.use_wandb:
@@ -729,9 +725,6 @@ def main(args):
                         torch.save(checkpoint, checkpoint_path)
                         logger.info(f"Saved checkpoint to {checkpoint_path}")
                     
-                    cloud_checkpoint_path = f"{cloud_checkpoint_dir}/{train_steps:07d}.pt"
-                    torch.save(checkpoint, cloud_checkpoint_path)
-                    logger.info(f"Saved checkpoint in cloud to {cloud_checkpoint_path}")
                 dist.barrier()
 
     model.eval()  # important! This disables randomized embedding dropout
@@ -750,8 +743,6 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--code-path", type=str, required=True)
-    parser.add_argument("--cloud-save-path", type=str, required=True, help='please specify a cloud disk path, if not, local path')
-    parser.add_argument("--no-local-save", action='store_true', help='no save checkpoints to local path for limited disk volume')
     parser.add_argument("--experiment-name", type=str, default=None, help='experiment name to prepend to checkpoint directory')
     parser.add_argument("--gpt-model", type=str, choices=list(GPT_models.keys()), default="GPT-B")
     parser.add_argument("--gpt-ckpt", type=str, default=None, help="ckpt path for resume training")

@@ -22,12 +22,35 @@ The pretrained tokenizer can be downloaded from the LlamaGen HuggingFace: [vq_ds
 
 Scripts for preparing the dataset load ESMC-600M through the `esmc` package, which automatically downloads the weights if they are not already cached. The weights can also be downloaded manually from Biohub HuggingFace: [esmc-600m.safetensors](https://huggingface.co/biohub/ESMC-600M/blob/main/model.safetensors)
 
+## Installation
+
+First clone the repository:
+
+```bash
+git clone https://github.com/microsoft/Vermeer.git
+cd Vermeer
+```
+
+Then create and activate a conda/mamba environment using the provided `vermeer.yaml` file:
+
+```bash
+mamba env create -f vermeer.yaml
+mamba activate vermeer
+```
+
+Finally, from the repository root, install Vermeer as an editable package:
+
+```bash
+pip install -e .
+```
+
 ## Training/Fine-tuning Vermeer
 
 To train a new model, first download the raw microscopy images from the Human Protein Atlas using the scripts `scripts/prepare_data/download_images_parallel.py` and `scripts/prepare_data/hpa_stratified_preprocessing_final.py`:
 
 ```bash
-python download_images_parallel.py --output-dir <OUTPUT_DIR>
+cd scripts/prepare_data
+python download_images_parallel.py --output-dir <output_dir>
 # specify the paths in the config file at the beginning of this script
 python hpa_stratified_preprocessing_final.py --image_size 256
 ```
@@ -35,19 +58,22 @@ python hpa_stratified_preprocessing_final.py --image_size 256
 Then compute the ESM-C embeddings:
 
 ```bash
+# From the repository root
+# Update paths to those set in the config file in scripts/prepare_data/hpa_stratified_preprocessing_final.py
 python vermeer/dataset/prepare_protein_prefix.py \
-    --input_dir input_dir \
+    --input_dir <input_dir> \
     --h5_filename protein_prefix.h5 \
-    --metadata_dir output_metadir \
+    --metadata_dir <output_metadata_dir> \
     --device cuda
 ```
 and tokenize all of the images:
 
 ```bash
+# Update paths to those set in the config file in scripts/prepare_data/hpa_stratified_preprocessing_final.py and for vq-ckpt if necessary.
 python vermeer/autoregressive/train/extract_codes_ca.py \
-    --data-path input_data_path \
-    --code-path output_code_path \
-    --vq-ckpt pretrained_models/vq_ds16_c2i.pt \
+    --data-path <input_data_path> \
+    --code-path <output_code_path> \
+    --vq-ckpt vq_ds16_c2i.pt \
     --ten-crop \
     --rotate \
     --debug \
@@ -60,19 +86,20 @@ python vermeer/autoregressive/train/extract_codes_ca.py \
 
 Before training, download the checkpoint needed for your workflow:
 
-- **Re-training Vermeer:** download a pretrained LlamaGen checkpoint from [LlamaGen](https://github.com/foundationvision/llamagen), such as [`c2i_L_256.pt`](https://huggingface.co/FoundationVision/LlamaGen/resolve/main/c2i_L_256.pt).
+- **Re-training Vermeer:** download a pretrained LlamaGen checkpoint from [LlamaGen](https://github.com/foundationvision/llamagen), such as [`c2i_L_256.pt`](https://huggingface.co/FoundationVision/LlamaGen/resolve/main/c2i_L_256.pt) and pass it with `--pretrained-gpt_ckpt`
 - **Fine-tuning Vermeer on new data:** download a Vermeer model checkpoint and pass it with `--gpt_ckpt`.
 
 Then run the training script `vermeer/autoregressive/train/train_ca.py`:
 
 ```bash
+# Update paths for results-dir (where model checkpoints are saved), code-path (input codes), and for --pretrained-gpt-ckpt / --gpt-ckpt if necessary. 
 torchrun \
     --nnodes=1 --nproc_per_node=2 --node_rank=0 \
     --master_port=12334 \
     vermeer/autoregressive/train/train_ca.py \
-    --results-dir output_dir \
+    --results-dir <output_dir> \
     --val-dirs val1,val2,cell_line_holdouts \
-    --code-path output_code_path \
+    --code-path <code_path> \
     --image-size 256 \
     --gpt-model GPT-L \
     --num-workers 8 \

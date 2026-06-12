@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vermeer"
+version = "0.1.0"
+description = "Vermeer: autoregressive microscopy image generation"
+requires-python = ">=3.10"
+
+# The repo's modules (utils, dataset, autoregressive, ...) live under vermeer/
+# and are imported as top-level packages (e.g. `from utils.logger import ...`).
+# They have no __init__.py, so discover them as PEP 420 namespace packages
+# with vermeer/ as the source root.
+[tool.setuptools.packages.find]
+where = ["vermeer"]
+namespaces = true
