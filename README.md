@@ -4,7 +4,7 @@ Autoregressive generative modeling of microscopy predicts protein localization.
 
 Vermeer extends autoregressive generative modeling of natural images to multi-channel microscopy images. We train Vermeer on the Human Protein Atlas, using protein language model features of protein sequence as conditioning information.
 
-Given the first three reference channels and a protein's ESM-C embedding, the model generates the corresponding fluorescent protein channel. `tutorial.ipynb` demonstrates this virtual staining task. To run this notebook, first download the example data and example model checkpoints (contains tokenizer checkpoint and vermeer-L checkpoint) from [vermeer_models_and_examples.zip](https://drive.google.com/file/d/1_sPZiUnn8yZFAsOopRxFH5_nzk-Tgiiw/view?usp=sharing). The provided yaml file `vermeer.yaml` can be used to create a conda/mamba environment to run this notebook.
+Given the first three reference channels and a protein's ESM-C embedding, the model generates the corresponding fluorescent protein channel. `tutorial.ipynb` demonstrates this virtual staining task. To run this notebook, first download the example data and example model checkpoints (contains tokenizer checkpoint and vermeer-L checkpoint). The provided yaml file `vermeer.yaml` can be used to create a conda/mamba environment to run this notebook.
 
 ![Unseen protein generation with attention](assets/unseen_protein_generation_w_attention.gif)
 
