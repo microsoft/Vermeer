@@ -55,6 +55,22 @@ from utils.optim import creat_optimizer, creat_llrd_optimizer
 #     n_channels = batch[0][2]  # Same for all items in batch
 #     return features, labels, n_channels
 
+def compute_anneal_prob(epoch, base_prob, start_epoch, end_epoch):
+    """
+    Linearly anneal the channel-augmentation probability from base_prob to 0.
+
+    - epoch < start_epoch:              returns base_prob (full randomization)
+    - start_epoch <= epoch < end_epoch: linearly interpolates base_prob -> 0
+    - epoch >= end_epoch:               returns 0.0 (fixed channel order)
+    """
+    if epoch < start_epoch:
+        return base_prob
+    if epoch >= end_epoch:
+        return 0.0
+    frac = (epoch - start_epoch) / (end_epoch - start_epoch)
+    return base_prob * (1.0 - frac)
+
+
 def apply_channel_augmentation(features_batch, n_channels, min_channels, tokens_per_channel=258):
     """
     Apply channel reordering/dropout augmentation to a batch of token sequences.
@@ -130,16 +146,24 @@ def apply_channel_config(features_batch, n_channels, channel_config, tokens_per_
 
 
 def make_collate_fn(channel_augment=False, min_channels=2, channel_augment_prob=0.5,
-                    n_channels=4, tokens_per_channel=258, channel_config=None):
+                    n_channels=4, tokens_per_channel=258, channel_config=None,
+                    prob_state=None):
     """
     Factory function that returns a collate callable with augmentation config captured.
 
     Args:
         channel_augment: bool, whether to enable channel reordering/dropout
         min_channels: int, minimum channels to keep when augmenting
-        channel_augment_prob: float, probability of applying augmentation per batch
+        channel_augment_prob: float, fixed probability of applying augmentation per batch
+            (used when prob_state is None)
         n_channels: int, number of channels in the dataset
         tokens_per_channel: int, tokens per channel block (SOC + codes + EOC)
+        prob_state: optional 1-element list holding the live augmentation probability.
+            When provided, the probability is read from prob_state[0] each batch, allowing
+            the training loop to anneal it across epochs (see --anneal-ca / compute_anneal_prob).
+            NOTE: this relies on DataLoader workers being re-forked each epoch
+            (persistent_workers=False, the default). If persistent_workers is ever enabled on
+            the train loader, the annealed value would freeze at the first epoch's value.
     """
     def collate_fn(batch):
         """
@@ -170,7 +194,8 @@ def make_collate_fn(channel_augment=False, min_channels=2, channel_augment_prob=
             )
 
         # Apply channel augmentation if enabled
-        if channel_augment and random.random() < channel_augment_prob:
+        cur_prob = prob_state[0] if prob_state is not None else channel_augment_prob
+        if channel_augment and random.random() < cur_prob:
             features, n_channels_batch = apply_channel_augmentation(
                 features, n_channels_batch, min_channels, tokens_per_channel
             )
@@ -414,6 +439,9 @@ def main(args):
         shuffle=True,
         seed=args.global_seed
     )
+    # Mutable holder for the live channel-augmentation probability. Updated per-epoch in the
+    # training loop when --anneal-ca is set; otherwise stays constant at the base probability.
+    ca_prob_state = [args.channel_augment_prob]
     collate_fn_train = make_collate_fn(
         channel_augment=args.channel_augment,
         min_channels=args.min_channels,
@@ -421,6 +449,7 @@ def main(args):
         n_channels=args.n_channels,
         tokens_per_channel=tokens_per_channel,
         channel_config=channel_config,
+        prob_state=ca_prob_state,
     )
     collate_fn_val = make_collate_fn(
         channel_augment=False,
@@ -443,6 +472,21 @@ def main(args):
         logger.info(
             f"Channel augmentation enabled: min_channels={args.min_channels}, prob={args.channel_augment_prob}, "
             f"effective_n_channels={effective_n_channels_for_training}"
+        )
+
+    # Validate channel-augmentation annealing args
+    if args.anneal_ca:
+        assert args.channel_augment, "--anneal-ca requires --channel-augment to be set."
+        assert args.anneal_ca_start_epoch is not None and args.anneal_ca_end_epoch is not None, \
+            "--anneal-ca requires both --anneal-ca-start-epoch and --anneal-ca-end-epoch."
+        assert 0 <= args.anneal_ca_start_epoch < args.anneal_ca_end_epoch <= args.epochs, \
+            (
+                f"--anneal-ca epochs must satisfy 0 <= start ({args.anneal_ca_start_epoch}) < "
+                f"end ({args.anneal_ca_end_epoch}) <= epochs ({args.epochs})."
+            )
+        logger.info(
+            f"Channel-augmentation annealing enabled: prob {args.channel_augment_prob} -> 0.0 "
+            f"linearly over epochs [{args.anneal_ca_start_epoch}, {args.anneal_ca_end_epoch})."
         )
 
     # Setup validation data:
@@ -559,6 +603,14 @@ def main(args):
     for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
+        # Anneal the channel-augmentation probability for this epoch (before the dataloader
+        # iterator re-forks its workers, so they inherit the updated value).
+        if args.channel_augment and args.anneal_ca:
+            ca_prob_state[0] = compute_anneal_prob(
+                epoch, args.channel_augment_prob,
+                args.anneal_ca_start_epoch, args.anneal_ca_end_epoch,
+            )
+            logger.info(f"[anneal-ca] epoch {epoch}: channel-augment prob = {ca_prob_state[0]:.4f}")
         for it, (z_with_eos, y, n_channels, np_mask, lens) in enumerate(train_loader): # dataloader adds EOS token
             g_it = epoch * iters_train + it 
 
@@ -660,6 +712,7 @@ def main(args):
                         "train/epoch": epoch,
                         "train/step": train_steps,
                         "train/learning_rate": optimizer.param_groups[0]['lr'],
+                        "train/channel_augment_prob": ca_prob_state[0],
                     }
                     wandb.log(log_dict, step=train_steps)
                 
@@ -790,6 +843,13 @@ if __name__ == "__main__":
     parser.add_argument("--channel-augment-prob", type=float, default=0.5, help="Probability of applying channel augmentation per batch (default: 0.5)")
     parser.add_argument("--channel-config", type=str, default=None,
         help="Comma-separated channel indices to select and order, e.g. '0,1,3' or '3,0'. Default: use all channels in original order.")
+    parser.add_argument("--anneal-ca", action='store_true',
+        help="Linearly anneal channel-augmentation probability to 0 between --anneal-ca-start-epoch "
+             "and --anneal-ca-end-epoch, then train with fixed channel order. Requires --channel-augment.")
+    parser.add_argument("--anneal-ca-start-epoch", type=int, default=None,
+        help="Epoch at which to begin annealing channel-augmentation probability (full prob before this).")
+    parser.add_argument("--anneal-ca-end-epoch", type=int, default=None,
+        help="Epoch at which channel-augmentation probability reaches 0 (fixed channel order after this).")
     args = parser.parse_args()
     main(args)
 
