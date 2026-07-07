@@ -300,6 +300,72 @@ def eval_ep(model, val_loader, val_loss, val_steps, device, args, ptdtype):
     return val_loss, val_steps
 
 
+def remap_extended_state_dict(state_dict, model, vocab_size, soc_channel_map=None, logger=None):
+    """Rewrite tok_embeddings_extended / output_extended in a checkpoint state dict into the
+    current model's channel layout, so a --gpt-ckpt trained with a different --n-channels can be
+    fine-tuned. Base codes [0:vocab_size] are copied directly; SOC/EOC rows are copied per channel
+    according to a pretrained->finetuned channel map; EOS is copied; finetuned channels with no
+    source mapping keep their freshly-initialized weights. Mutates and returns state_dict.
+
+    soc_channel_map: optional str "p:f,p:f,..." (pretrained channel : finetuned channel). If None
+    and the channel counts differ, an identity map over range(min(ckpt_n, model_n)) is used.
+    """
+    key0 = "tok_embeddings_extended.weight"
+    if key0 not in state_dict:
+        return state_dict
+
+    cfg = model.config
+    ckpt_ext = state_dict[key0].shape[0]
+    model_ext = model.tok_embeddings_extended.weight.shape[0]
+    # invert extended_vocab_size = vocab_size + 2*n_channels + 1
+    ckpt_n = (ckpt_ext - vocab_size - 1) // 2
+    model_n = (model_ext - vocab_size - 1) // 2
+
+    if ckpt_ext == model_ext and soc_channel_map is None:
+        return state_dict  # same layout, nothing to remap
+
+    # Build pretrained -> finetuned channel mapping
+    if soc_channel_map:
+        mapping = {}
+        for pair in soc_channel_map.split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            p_str, f_str = pair.split(":")
+            mapping[int(p_str)] = int(f_str)
+    else:
+        mapping = {c: c for c in range(min(ckpt_n, model_n))}
+
+    for p, f in mapping.items():
+        assert 0 <= p < ckpt_n, f"pretrained channel {p} out of range [0,{ckpt_n})"
+        assert 0 <= f < model_n, f"finetuned channel {f} out of range [0,{model_n})"
+
+    # Pretrained-side token id helpers (use ckpt_n, not the model's n_max_channels)
+    def src_soc(c):
+        return vocab_size + c
+    def src_eoc(c):
+        return vocab_size + ckpt_n + c
+    src_eos = vocab_size + 2 * ckpt_n
+
+    for key, dst_param in (
+        ("tok_embeddings_extended.weight", model.tok_embeddings_extended.weight),
+        ("output_extended.weight", model.output_extended.weight),
+    ):
+        ckpt_w = state_dict[key]
+        new_w = dst_param.detach().cpu().clone()  # start from model's fresh init -> preserves unmapped channels
+        new_w[:vocab_size] = ckpt_w[:vocab_size]  # base VQ codes
+        for p, f in mapping.items():
+            new_w[cfg.soc_token_id(f)] = ckpt_w[src_soc(p)]
+            new_w[cfg.eoc_token_id(f)] = ckpt_w[src_eoc(p)]
+        new_w[cfg.eos_token_id] = ckpt_w[src_eos]  # EOS
+        state_dict[key] = new_w
+
+    if logger is not None:
+        logger.info(
+            f"Remapped extended tables: ckpt_n={ckpt_n} -> model_n={model_n}, "
+            f"map(pretrained->finetuned)={mapping}"
+        )
+    return state_dict
 
 
 #################################################################################
@@ -520,16 +586,31 @@ def main(args):
     # Prepare models for training:
     if args.gpt_ckpt:
         checkpoint = torch.load(args.gpt_ckpt, map_location="cpu", weights_only=False)
+        # Normalize checkpoint format. LlamaGen .pt checkpoints wrap weights under
+        # "model" (and optionally "ema"/"optimizer"/"steps"); vermeer .ckpt files
+        # store the raw model state_dict at the top level. Handle both.
+        if "model" not in checkpoint:
+            if "state_dict" in checkpoint:
+                checkpoint = {"model": checkpoint["state_dict"]}
+            else:
+                checkpoint = {"model": checkpoint}
         assert_esm_model_match(checkpoint, args.esm_model, args.gpt_ckpt, warn=logger.info)
+        checkpoint["model"] = remap_extended_state_dict(
+            checkpoint["model"], model, args.vocab_size, args.soc_channel_map, logger)
         model.load_state_dict(checkpoint["model"], strict=False)
         if args.ema:
             ema.load_state_dict(checkpoint["ema"] if "ema" in checkpoint else checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"]) if "optimizer" in checkpoint else None 
-        train_steps = checkpoint["steps"] if "steps" in checkpoint else 0
-        start_epoch = int(train_steps / int(len(train_dataset) / args.global_batch_size))
-        train_steps = int(start_epoch * int(len(train_dataset) / args.global_batch_size))
+        if args.resume:
+            optimizer.load_state_dict(checkpoint["optimizer"]) if "optimizer" in checkpoint else None
+            train_steps = checkpoint["steps"] if "steps" in checkpoint else 0
+            start_epoch = int(train_steps / int(len(train_dataset) / args.global_batch_size))
+            train_steps = int(start_epoch * int(len(train_dataset) / args.global_batch_size))
+            logger.info(f"Resume training from checkpoint: {args.gpt_ckpt}")
+        else:
+            train_steps = 0
+            start_epoch = 0
+            logger.info(f"Loaded weights only (fresh run) from checkpoint: {args.gpt_ckpt}")
         del checkpoint
-        logger.info(f"Resume training from checkpoint: {args.gpt_ckpt}")
         logger.info(f"Initial state: steps={train_steps}, epochs={start_epoch}")
     elif args.pretrained_gpt_ckpt:
         try:
@@ -537,10 +618,6 @@ def main(args):
         except:
             # if using microscoppy-trained model as pre-trained gpt ckpt, i.e. in fine-tuning after channel-augmented pre-training
             checkpoint = torch.load(args.pretrained_gpt_ckpt, map_location="cpu", weights_only=False)
-
-        # LlamaGen base checkpoints record no esm_model (guard warns only); a
-        # channel-augmented Vermeer pretrain does, so verify it matches.
-        assert_esm_model_match(checkpoint, args.esm_model, args.pretrained_gpt_ckpt, warn=logger.info)
 
         # pretrained_state = checkpoint["model"] # logic for B, L, XL models
         if "model" in checkpoint:
@@ -799,7 +876,14 @@ if __name__ == "__main__":
     parser.add_argument("--code-path", type=str, required=True)
     parser.add_argument("--experiment-name", type=str, default=None, help='experiment name to prepend to checkpoint directory')
     parser.add_argument("--gpt-model", type=str, choices=list(GPT_models.keys()), default="GPT-B")
-    parser.add_argument("--gpt-ckpt", type=str, default=None, help="ckpt path for resume training")
+    parser.add_argument("--gpt-ckpt", type=str, default=None, help="ckpt path to initialize from; loads model weights only and starts a fresh run unless --resume is set")
+    parser.add_argument("--resume", action='store_true', help="resume from --gpt-ckpt: restore optimizer state and step/epoch counters. Default (no --resume): load model weights only and start a fresh run (steps=0).")
+    parser.add_argument("--soc-channel-map", type=str, default=None,
+        help="Optional pretrained->finetuned channel remap for SOC/EOC token embeddings when "
+             "fine-tuning a --gpt-ckpt trained with a different --n-channels. "
+             "Format 'p:f,p:f' e.g. '0:0,1:1,2:4' (pretrained channel : finetuned channel). "
+             "Unlisted finetuned channels keep fresh init. If omitted and channel counts differ, "
+             "an identity overlap map (channels 0..min(ckpt,model)-1) is applied automatically.")
     parser.add_argument("--gpt-type", type=str, choices=['ca', 'ca_binary_prefix', 'ca_esm_embed_mean_pool', 'ca_esm_embed_full'], default="ca", help="type of conditioning")
     parser.add_argument("--esm-model", type=str, choices=list(ESM_MODEL_DIMS.keys()), default="esmc_600m",
                         help="ESM-C model used to generate the conditioning embeddings; sets the "
