@@ -38,7 +38,7 @@ from sklearn.metrics import label_ranking_average_precision_score, coverage_erro
 sys.path.append(os.path.join(os.path.dirname(__file__), "../.."))
 
 from tokenizer.tokenizer_image.vq_model import VQ_models
-from autoregressive.models.gpt_ca import GPT_models, ESM_MODEL_DIMS
+from autoregressive.models.gpt_ca import GPT_models, ESM_MODEL_DIMS, assert_esm_model_match
 from autoregressive.models.generate_ca import (
     generate_with_prefix,
     decode_tokens_to_images,
@@ -232,6 +232,7 @@ def load_models(args, device):
     ).to(device=device, dtype=precision)
 
     checkpoint = torch.load(args.model_checkpoint, map_location="cpu", weights_only=False)
+    assert_esm_model_match(checkpoint, args.esm_model, args.model_checkpoint)
     if "model" in checkpoint:
         model_weight = checkpoint["model"]
     elif "module" in checkpoint:

@@ -26,6 +26,50 @@ def find_multiple(n: int, k: int):
 # for both training and inference model construction.
 ESM_MODEL_DIMS = {"esmc_300m": 1152, "esmc_600m": 1152, "esmc_6b": 2560}
 
+
+def checkpoint_esm_model(checkpoint):
+    """Return the esm_model a checkpoint was trained with, or None if unrecorded.
+
+    Checkpoints saved by ``train_ca.py`` stash the full argparse Namespace under
+    ``checkpoint["args"]``; LlamaGen base checkpoints and raw state_dicts have no
+    such record, in which case the esm_model cannot be recovered.
+    """
+    ckpt_args = checkpoint.get("args") if isinstance(checkpoint, dict) else None
+    if ckpt_args is None:
+        return None
+    if isinstance(ckpt_args, dict):
+        return ckpt_args.get("esm_model")
+    return getattr(ckpt_args, "esm_model", None)
+
+
+def assert_esm_model_match(checkpoint, esm_model, ckpt_path="checkpoint", warn=print):
+    """Guard against loading weights trained with a different ESM conditioning model.
+
+    A mismatched ``esm_model`` only *sometimes* fails via shape errors in
+    ``load_state_dict`` (esmc_600m<->esmc_6b differ in esm_dim, so they raise a
+    size mismatch). The esmc_300m<->esmc_600m case shares esm_dim=1152, so it would
+    otherwise load silently and run on embeddings from the wrong model. When the
+    checkpoint records its esm_model, require it to match; otherwise warn that it
+    can't be verified. ``warn`` may be any callable (e.g. ``print`` or
+    ``logger.info``); pass ``None`` to suppress the unverifiable-checkpoint notice.
+    """
+    ckpt_esm = checkpoint_esm_model(checkpoint)
+    if ckpt_esm is None:
+        if warn is not None:
+            warn(
+                f"{ckpt_path} has no recorded esm_model; cannot verify it matches "
+                f"esm_model={esm_model}. Ensure they are consistent."
+            )
+        return
+    if ckpt_esm != esm_model:
+        raise ValueError(
+            f"ESM model mismatch: requested esm_model={esm_model} "
+            f"(esm_dim={ESM_MODEL_DIMS.get(esm_model, '?')}) but checkpoint {ckpt_path} "
+            f"was trained with esm_model={ckpt_esm} "
+            f"(esm_dim={ESM_MODEL_DIMS.get(ckpt_esm, '?')}). Use esm_model={ckpt_esm} "
+            f"for this checkpoint, and label files generated with the same ESM model."
+        )
+
 @dataclass
 class ModelArgs:
     dim: int = 4096

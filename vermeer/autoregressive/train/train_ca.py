@@ -33,7 +33,7 @@ from utils.logger import create_logger
 from utils.distributed import init_distributed_mode
 from utils.ema import update_ema, requires_grad
 from dataset.build import build_dataset
-from autoregressive.models.gpt_ca import GPT_models, ESM_MODEL_DIMS
+from autoregressive.models.gpt_ca import GPT_models, ESM_MODEL_DIMS, assert_esm_model_match
 from dataset.ca_image import build_ca_code
 from utils.lr_control import lr_wd_annealing
 from utils.optim import creat_optimizer, creat_llrd_optimizer
@@ -43,6 +43,7 @@ from utils.optim import creat_optimizer, creat_llrd_optimizer
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
+
 # def custom_collate_fn(batch):
 #     """
 #     Custom collate function for CA dataset.
@@ -519,6 +520,7 @@ def main(args):
     # Prepare models for training:
     if args.gpt_ckpt:
         checkpoint = torch.load(args.gpt_ckpt, map_location="cpu", weights_only=False)
+        assert_esm_model_match(checkpoint, args.esm_model, args.gpt_ckpt, warn=logger.info)
         model.load_state_dict(checkpoint["model"], strict=False)
         if args.ema:
             ema.load_state_dict(checkpoint["ema"] if "ema" in checkpoint else checkpoint["model"])
@@ -534,9 +536,13 @@ def main(args):
             checkpoint = torch.load(args.pretrained_gpt_ckpt, map_location="cpu",)
         except:
             # if using microscoppy-trained model as pre-trained gpt ckpt, i.e. in fine-tuning after channel-augmented pre-training
-            checkpoint = torch.load(args.pretrained_gpt_ckpt, map_location="cpu", weights_only=False) 
+            checkpoint = torch.load(args.pretrained_gpt_ckpt, map_location="cpu", weights_only=False)
 
-        # pretrained_state = checkpoint["model"] # logic for B, L, XL models 
+        # LlamaGen base checkpoints record no esm_model (guard warns only); a
+        # channel-augmented Vermeer pretrain does, so verify it matches.
+        assert_esm_model_match(checkpoint, args.esm_model, args.pretrained_gpt_ckpt, warn=logger.info)
+
+        # pretrained_state = checkpoint["model"] # logic for B, L, XL models
         if "model" in checkpoint:
             pretrained_state = checkpoint["model"] # logic for B, L, XL models 
         else:
