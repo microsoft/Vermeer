@@ -37,3 +37,6 @@ dependencies:
       - torchvision==0.25.0
       # ESM-C 600M embeddings (dataset/prepare_protein_prefix.py: `from esm.models.esmc import ESMC`)
       - esm
+      # ESM-C 6B via HuggingFace (dataset/prepare_protein_prefix.py --esm_model esmc_6b: biohub/ESMC-6B)
+      - transformers
+      - accelerate  # device_map="auto" for loading the 6B checkpoint (optional; code falls back if absent)

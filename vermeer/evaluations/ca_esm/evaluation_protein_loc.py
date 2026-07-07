@@ -38,7 +38,7 @@ from sklearn.metrics import label_ranking_average_precision_score, coverage_erro
 sys.path.append(os.path.join(os.path.dirname(__file__), "../.."))
 
 from tokenizer.tokenizer_image.vq_model import VQ_models
-from autoregressive.models.gpt_ca import GPT_models
+from autoregressive.models.gpt_ca import GPT_models, ESM_MODEL_DIMS
 from autoregressive.models.generate_ca import (
     generate_with_prefix,
     decode_tokens_to_images,
@@ -227,7 +227,8 @@ def load_models(args, device):
         vocab_size=args.codebook_size,
         n_max_channels=args.n_max_channels,
         block_size_per_channel=args.block_size_per_channel,
-        model_type=args.model_type
+        model_type=args.model_type,
+        esm_dim=ESM_MODEL_DIMS[args.esm_model],
     ).to(device=device, dtype=precision)
 
     checkpoint = torch.load(args.model_checkpoint, map_location="cpu", weights_only=False)
@@ -802,6 +803,14 @@ def parse_args():
         type=str,
         default="ca_esm_embed_mean_pool",
         help="Model type (default: ca_esm_embed_mean_pool)"
+    )
+    parser.add_argument(
+        "--esm_model",
+        type=str,
+        choices=list(ESM_MODEL_DIMS.keys()),
+        default="esmc_600m",
+        help="ESM-C model the checkpoint was trained with; sets conditioning input dim "
+             "(esmc_600m=1152, esmc_6b=2560). Must match the trained checkpoint."
     )
     parser.add_argument(
         "--codebook_size",

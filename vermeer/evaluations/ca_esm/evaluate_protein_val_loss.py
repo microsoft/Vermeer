@@ -34,7 +34,7 @@ from tqdm import tqdm
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../.."))
 
-from autoregressive.models.gpt_ca import GPT_models
+from autoregressive.models.gpt_ca import GPT_models, ESM_MODEL_DIMS
 from dataset.ca_image import build_ca_code
 
 
@@ -107,6 +107,14 @@ def parse_args():
         type=str,
         default="ca_esm_embed_mean_pool",
         choices=["ca", "ca_binary_prefix", "ca_esm_embed_mean_pool", "ca_esm_embed_full"],
+    )
+    parser.add_argument(
+        "--esm_model",
+        type=str,
+        default="esmc_600m",
+        choices=list(ESM_MODEL_DIMS.keys()),
+        help="ESM model whose embedding width the checkpoint was trained with "
+             "(sets esm_dim for the conditioning projection)",
     )
     parser.add_argument("--vocab_size", type=int, default=16384)
     parser.add_argument(
@@ -294,6 +302,7 @@ def load_gpt_model(args, device, ptdtype):
         num_classes=args.num_classes,
         cls_token_num=args.cls_token_num,
         model_type=args.gpt_type,
+        esm_dim=ESM_MODEL_DIMS[args.esm_model],
     ).to(device=device, dtype=model_dtype)
 
     checkpoint = torch.load(args.model_checkpoint, map_location="cpu", weights_only=False)
@@ -306,7 +315,14 @@ def load_gpt_model(args, device, ptdtype):
     else:
         model_weight = checkpoint
 
-    model.load_state_dict(model_weight, strict=False)
+    missing, unexpected = model.load_state_dict(model_weight, strict=False)
+    cond_problems = [k for k in (list(missing) + list(unexpected)) if "cls_embedding" in k]
+    if cond_problems:
+        raise RuntimeError(
+            f"Conditioning embedder weights did not load cleanly: {cond_problems}. "
+            f"This usually means --esm_model ({args.esm_model}, esm_dim="
+            f"{ESM_MODEL_DIMS[args.esm_model]}) does not match the checkpoint."
+        )
     model.eval()
     return model, block_size_per_channel
 

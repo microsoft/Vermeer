@@ -27,7 +27,7 @@ from PIL import Image
 sys.path.append(os.path.join(os.path.dirname(__file__), "../.."))
 
 from tokenizer.tokenizer_image.vq_model import VQ_models
-from autoregressive.models.gpt_ca import GPT_models
+from autoregressive.models.gpt_ca import GPT_models, ESM_MODEL_DIMS
 from autoregressive.models.generate_ca import (
     generate,
     generate_with_prefix,
@@ -58,6 +58,7 @@ def load_models(args, device):
         n_max_channels=args.n_max_channels,
         block_size_per_channel=args.block_size_per_channel,
         model_type=args.model_type,
+        esm_dim=ESM_MODEL_DIMS[args.esm_model],
     ).to(device=device, dtype=precision)
 
     checkpoint = torch.load(args.model_checkpoint, map_location="cpu", weights_only=False)
@@ -70,7 +71,14 @@ def load_models(args, device):
     else:
         model_weight = checkpoint
 
-    gpt_model.load_state_dict(model_weight, strict=False)
+    missing, unexpected = gpt_model.load_state_dict(model_weight, strict=False)
+    cond_problems = [k for k in (list(missing) + list(unexpected)) if "cls_embedding" in k]
+    if cond_problems:
+        raise RuntimeError(
+            f"Conditioning embedder weights did not load cleanly: {cond_problems}. "
+            f"This usually means --esm_model ({args.esm_model}, esm_dim="
+            f"{ESM_MODEL_DIMS[args.esm_model]}) does not match the checkpoint."
+        )
     gpt_model.eval()
     del checkpoint
     print(f"GPT-CA model loaded from {args.model_checkpoint}")
@@ -195,6 +203,10 @@ def parse_args():
     parser.add_argument("--vq_model", type=str, default="VQ-16")
     parser.add_argument("--gpt_model", type=str, default="GPT-B")
     parser.add_argument("--model_type", type=str, default="ca_esm_embed_mean_pool")
+    parser.add_argument("--esm_model", type=str, default="esmc_600m",
+                        choices=list(ESM_MODEL_DIMS.keys()),
+                        help="ESM model whose embedding width the checkpoint was trained with "
+                             "(sets esm_dim for the conditioning projection)")
     parser.add_argument("--codebook_size", type=int, default=16384)
     parser.add_argument("--codebook_embed_dim", type=int, default=8)
     parser.add_argument("--n_channels", type=int, default=4)

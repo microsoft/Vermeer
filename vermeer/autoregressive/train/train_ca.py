@@ -33,7 +33,7 @@ from utils.logger import create_logger
 from utils.distributed import init_distributed_mode
 from utils.ema import update_ema, requires_grad
 from dataset.build import build_dataset
-from autoregressive.models.gpt_ca import GPT_models
+from autoregressive.models.gpt_ca import GPT_models, ESM_MODEL_DIMS
 from dataset.ca_image import build_ca_code
 from utils.lr_control import lr_wd_annealing
 from utils.optim import creat_optimizer, creat_llrd_optimizer
@@ -395,6 +395,7 @@ def main(args):
         num_classes=args.num_classes,
         cls_token_num=args.cls_token_num,
         model_type=args.gpt_type,
+        esm_dim=ESM_MODEL_DIMS[args.esm_model],
         resid_dropout_p=dropout_p,
         ffn_dropout_p=dropout_p,
         drop_path_rate=args.drop_path_rate,
@@ -403,6 +404,7 @@ def main(args):
     ).to(device)
     logger.info(f"GPT-CA Parameters: {sum(p.numel() for p in model.parameters()):,}")
     logger.info(f"Model config: n_max_channels={n_max_channels_for_model}, block_size_per_channel={block_size_per_channel}")
+    logger.info(f"ESM conditioning: esm_model={args.esm_model}, esm_dim={ESM_MODEL_DIMS[args.esm_model]}")
     logger.info(f"Extended vocab size: {model.extended_vocab_size}")
 
     if args.ema:
@@ -793,6 +795,10 @@ if __name__ == "__main__":
     parser.add_argument("--gpt-model", type=str, choices=list(GPT_models.keys()), default="GPT-B")
     parser.add_argument("--gpt-ckpt", type=str, default=None, help="ckpt path for resume training")
     parser.add_argument("--gpt-type", type=str, choices=['ca', 'ca_binary_prefix', 'ca_esm_embed_mean_pool', 'ca_esm_embed_full'], default="ca", help="type of conditioning")
+    parser.add_argument("--esm-model", type=str, choices=list(ESM_MODEL_DIMS.keys()), default="esmc_600m",
+                        help="ESM-C model used to generate the conditioning embeddings; sets the "
+                             "conditioning input dim (esmc_600m=1152, esmc_6b=2560). Must match the "
+                             "model used to generate the ca*_labels/ files.")
     parser.add_argument("--vocab-size", type=int, default=16384, help="vocabulary size of visual tokenizer")
     parser.add_argument("--pretrained-gpt-ckpt", type=str, default=None, help="pretrained GPT model checkpoint path")
     parser.add_argument("--ema", action='store_true', help="whether using ema training")

@@ -37,6 +37,7 @@ CHECKPOINT_NUMBER="0075000"
 DECODE_BATCH_SIZE=256
 GPT_MODEL="GPT-L"
 MODEL_TYPE="ca_esm_embed_mean_pool"
+ESM_MODEL="esmc_600m"  # ESM-C model the checkpoint was trained with (esmc_600m=1152, esmc_6b=2560); must match the checkpoint
 N_MAX_CHANNELS=4
 
 
@@ -101,6 +102,7 @@ python vermeer/evaluations/ca_esm/generate_images.py \
     --val_split "$VAL_SPLIT" \
     --gpt_model "$GPT_MODEL" \
     --model_type "$MODEL_TYPE" \
+    --esm_model "$ESM_MODEL" \
     --generation_mode "$GENERATION_MODE" \
     --batch_size "$BATCH_SIZE" \
     --decode_batch_size "$DECODE_BATCH_SIZE" \
@@ -127,6 +129,7 @@ python vermeer/evaluations/ca_esm/evaluate_protein_val_loss.py \
     --val_splits "$VAL_SPLIT" \
     --gpt_model "$GPT_MODEL" \
     --gpt_type "$MODEL_TYPE" \
+    --esm_model "$ESM_MODEL" \
     --image_size "$IMAGE_SIZE" \
     --n_channels 4 \
     --n_max_channels $N_MAX_CHANNELS \

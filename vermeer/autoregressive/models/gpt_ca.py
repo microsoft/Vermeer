@@ -22,6 +22,10 @@ def find_multiple(n: int, k: int):
         return n
     return n + k - (n % k)
 
+# Canonical ESM-C model -> conditioning embedding width. Single source of truth
+# for both training and inference model construction.
+ESM_MODEL_DIMS = {"esmc_300m": 1152, "esmc_600m": 1152, "esmc_6b": 2560}
+
 @dataclass
 class ModelArgs:
     dim: int = 4096
@@ -47,6 +51,7 @@ class ModelArgs:
 
     num_classes: int = 1000
     caption_dim: int = 2048
+    esm_dim: int = 1152  # conditioning embedding width (esmc_600m=1152, esmc_6b=2560)
     class_dropout_prob: float = 0.1
     model_type: str = 'ca'
 
@@ -430,11 +435,11 @@ class Transformer(nn.Module):
         elif self.model_type == 'ca_binary_prefix':
             self.cls_embedding = LabelEmbedder(2, config.dim, config.class_dropout_prob)
         elif self.model_type == 'ca_esm_embed_mean_pool':
-            esm_dim = 1152
+            esm_dim = config.esm_dim
             self.cls_embedding = CaptionEmbedder(esm_dim, config.dim, config.class_dropout_prob, token_num=self.cls_token_num)
         elif self.model_type == 'ca_esm_embed_full':
-            esm_dim = 1152
-            # input esm is [AA, 1152]
+            esm_dim = config.esm_dim
+            # input esm is [AA, esm_dim]
             # self.cls_embedding = ESMConvPoolEmbedder(esm_dim, config.dim, config.class_dropout_prob, token_num=self.cls_token_num)
             self.cls_embedding = ESMAttentionPoolEmbedder(esm_dim, config.dim, config.class_dropout_prob, token_num=self.cls_token_num)
         else:
@@ -582,9 +587,6 @@ class Transformer(nn.Module):
                 # print(f"cond_embeddings shape: {cond_embeddings.shape}")
             elif self.model_type == 'ca_esm_embed_mean_pool' or self.model_type == 'ca_esm_embed_full':
                 ## TODO: fix this in dataloader / extract_codes_ca.py instead 
-                # print("cond_idx shape:", cond_idx.shape) # in preprocessing, cls and eos token are removed, mean pooled\
-                # print("cond_idx:", cond_idx)
-                # print(self.cls_token_num)
                 # look for all 0s or nans in cond_idx
                 if torch.isnan(cond_idx).any():
                     raise ValueError("cond_idx contains nans")

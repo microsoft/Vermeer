@@ -26,6 +26,15 @@ import time
 
 # Global client (initialized lazily)
 _client = None
+_client_model = None  # tracks which checkpoint _client holds, so we can reload on change
+_tokenizer = None     # HF tokenizer, only used for transformers-loaded checkpoints (e.g. esmc_6b)
+
+# Checkpoints that are not in the esm package's LOCAL_MODEL_REGISTRY and must be
+# loaded via HuggingFace transformers instead of ESMC.from_pretrained. Maps the
+# --esm_model name to its HF Hub repo id.
+_HF_MODEL_IDS = {
+    "esmc_6b": "biohub/ESMC-6B",  # 2560-dim; ESMC.from_pretrained has no esmc_6b entry
+}
 
 # as discussed and demonstrated in the following 2 links, disable autocast and explicitly use float32 to avoid precision issues
 # https://github.com/ziul-bio/SWAT/blob/main/scripts/extract_ESMC.py
@@ -66,36 +75,112 @@ CLASS2NAME = {
     30: "Unknown",
 }
 
-def get_client(device="cuda"):
-    """Get or initialize the ESM-C client."""
-    global _client
-    if _client is None:
-        print(f"Loading ESM-C 600M model on {device}...")
-        _client = ESMC.from_pretrained("esmc_600m").to(device)
-        _client = _client.to(torch.float32) # explicitly cast to float32 to avoid precision issues
+def get_client(device="cuda", model_name="esmc_600m"):
+    """Get or initialize the ESM-C client.
+
+    Args:
+        model_name: ESM-C checkpoint. "esmc_600m" (default, 1152-dim) and
+            "esmc_300m" load via ESMC.from_pretrained (esm package). "esmc_6b"
+            (2560-dim) is not in the esm local registry, so it is loaded from
+            HuggingFace (_HF_MODEL_IDS) as an AutoModelForMaskedLM. The client is
+            cached and reloaded only if a different model_name is requested.
+    """
+    global _client, _client_model, _tokenizer
+    if _client is None or _client_model != model_name:
+        print(f"Loading {model_name} model on {device}...")
+        if model_name in _HF_MODEL_IDS:
+            from transformers import AutoModelForMaskedLM, AutoTokenizer
+            hf_id = _HF_MODEL_IDS[model_name]
+            # Keep float32 for precision (matches the esm-package path); 6B in
+            # fp32 is ~24GB and fits a single 80GB GPU. trust_remote_code is
+            # needed because ESM-C is not a native transformers architecture.
+            load_kwargs = dict(dtype=torch.float32, trust_remote_code=True)
+            try:
+                import accelerate  # noqa: F401  (required for device_map="auto")
+                _client = AutoModelForMaskedLM.from_pretrained(
+                    hf_id, device_map="auto", **load_kwargs
+                ).eval()
+            except ImportError:
+                # No accelerate: load on a single device (fine for the 1-GPU job).
+                _client = AutoModelForMaskedLM.from_pretrained(
+                    hf_id, **load_kwargs
+                ).eval().to(device)
+            _tokenizer = AutoTokenizer.from_pretrained(hf_id, trust_remote_code=True)
+        else:
+            _client = ESMC.from_pretrained(model_name).to(device)
+            _client = _client.to(torch.float32) # explicitly cast to float32 to avoid precision issues
+            _tokenizer = None
+        _client_model = model_name
     return _client
 
-def embed_sequence(seq, device="cuda"):
-    """Generate ESM-C embedding for a single sequence (FASTA format)."""
-    client = get_client(device)
+def embed_sequence(seq, device="cuda", esm_layer=-1, model_name="esmc_600m"):
+    """Generate ESM-C embedding for a single sequence (FASTA format).
+
+    Args:
+        esm_layer: Which ESM-C hidden layer to extract. -1 (default) returns the
+            final post-norm embeddings >=0 selects an
+            intermediate hidden state (0 = embedding output, 1..N = after each
+            transformer block).
+        model_name: ESM-C checkpoint to load (see get_client).
+    """
+    client = get_client(device, model_name=model_name)
+
+    if model_name in _HF_MODEL_IDS:
+        return _embed_sequence_hf(seq, client, _tokenizer, esm_layer=esm_layer)
+
     protein = ESMProtein(seq)
 
     with torch.no_grad():
         with torch.autocast(device_type='cuda', enabled=False):
             protein_tensor = client.encode(protein)
-            logits_output = client.logits(
-                protein_tensor, LogitsConfig(sequence=True, return_embeddings=True)
-            )
-            protein_embedding = logits_output.embeddings  # (L+2, dim) bc of cls token and EOS token
-            cls_token_emb = protein_embedding[0][0].squeeze()
-            protein_embedding = protein_embedding.squeeze()[1:-1] # remove cls and eos tokens
+            if esm_layer < 0:
+                logits_output = client.logits(
+                    protein_tensor, LogitsConfig(sequence=True, return_embeddings=True)
+                )
+                protein_embedding = logits_output.embeddings.squeeze()  # (L+2, 1152)
+            else:
+                logits_output = client.logits(
+                    protein_tensor,
+                    LogitsConfig(sequence=True, return_hidden_states=True,
+                                 ith_hidden_layer=esm_layer),
+                )
+                # hidden_states is [1, B, L+2, 1152] for a single layer
+                protein_embedding = logits_output.hidden_states.squeeze()  # (L+2, 1152)
+            cls_token_emb = protein_embedding[0].squeeze()
+            protein_embedding = protein_embedding[1:-1] # remove cls and eos tokens
             mean_pooled_embedding = extract_mean_representation(protein_embedding)
-            
+
     return protein_embedding.detach().cpu().numpy(), mean_pooled_embedding.detach().cpu().numpy(), cls_token_emb.detach().cpu().numpy()
+
+def _embed_sequence_hf(seq, model, tokenizer, esm_layer=-1):
+    """ESM-C embedding for a single sequence via a HuggingFace transformers
+    checkpoint (e.g. biohub/ESMC-6B). Mirrors embed_sequence's return contract:
+    (per-residue [L, dim], mean-pooled [dim], cls [dim]).
+
+    esm_layer indexes HF's output_hidden_states tuple, whose convention matches
+    the esm-package path: 0 = embedding output, i = after transformer block i,
+    -1 = final layer (the default representation). ESM-C tokenization adds a
+    leading cls (BOS) and trailing eos, so we drop [0] and [-1] for the
+    per-residue embedding.
+    """
+    inputs = tokenizer([seq], return_tensors="pt", padding=True)
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    with torch.inference_mode():
+        output = model(**inputs, output_hidden_states=True)
+
+    hidden = output.hidden_states[esm_layer]        # [1, L+2, dim]
+    protein_embedding = hidden.squeeze(0).float()   # [L+2, dim]
+    cls_token_emb = protein_embedding[0]
+    protein_embedding = protein_embedding[1:-1]     # remove cls and eos tokens
+    mean_pooled_embedding = extract_mean_representation(protein_embedding)
+
+    return (protein_embedding.detach().cpu().numpy(),
+            mean_pooled_embedding.detach().cpu().numpy(),
+            cls_token_emb.detach().cpu().numpy())
 
 def extract_mean_representation(protein_embedding):
     """Extract mean representation from protein embedding."""
-    return protein_embedding.squeeze().mean(axis=0)
+    return protein_embedding.mean(axis=0)
 
 def get_uniprot_protein_sequence(uniprot_id):
     """Fetch protein sequence from UniProt API."""
@@ -185,7 +270,7 @@ def build_uniprot_to_filenames(filenames):
     return uniprot_to_filenames, unique_uniprots
 
 # TODO: add batching for efficiency to uniprot download and esm embedding
-def fetch_and_embed_sequences(unique_uniprots, output_embeddings_h5, device="cuda"):
+def fetch_and_embed_sequences(unique_uniprots, output_embeddings_h5, device="cuda", esm_layer=-1, model_name="esmc_600m"):
     """Fetch sequences and generate embeddings, streaming to disk."""
     failed_uniprots = []
     
@@ -202,7 +287,7 @@ def fetch_and_embed_sequences(unique_uniprots, output_embeddings_h5, device="cud
                     failed_uniprots.append(uniprot_id)
                     continue
                 
-                protein_embedding, mean_pooled_embedding, cls_token_emb = embed_sequence(fasta_sequence, device=device)
+                protein_embedding, mean_pooled_embedding, cls_token_emb = embed_sequence(fasta_sequence, device=device, esm_layer=esm_layer, model_name=model_name)
                 # Write immediately to disk, don't keep in memory
                 full_grp.create_dataset(uniprot_id, data=protein_embedding)
                 mean_pool_grp.create_dataset(uniprot_id, data=mean_pooled_embedding)
@@ -451,7 +536,7 @@ def write_localization_category_to_h5(input_dir, metadata_dir, output_path):
     print("="*60)
 
 
-def add_esm_embeddings_to_h5(input_dir, h5_filename, device="cuda", skip_cache=False):
+def add_esm_embeddings_to_h5(input_dir, h5_filename, device="cuda", skip_cache=False, esm_layer=-1, model_name="esmc_600m"):
     """
     Add ESM-C embeddings to an existing protein prefix h5 file.
 
@@ -460,6 +545,9 @@ def add_esm_embeddings_to_h5(input_dir, h5_filename, device="cuda", skip_cache=F
         h5_filename: Name of the input h5 file
         device: Device to run ESM-C model on (cuda or cpu)
         skip_cache: If True, force regeneration of embeddings even if cached file exists
+        esm_layer: ESM-C hidden layer to extract (-1 = final post-norm, >=0 = intermediate)
+        model_name: ESM-C checkpoint (esmc_600m, esmc_300m, esmc_6b). The intermediate
+            cache filename is namespaced by model so different models/layers never collide.
     """
     # Paths
     h5_path = os.path.join(input_dir, h5_filename)
@@ -477,8 +565,13 @@ def add_esm_embeddings_to_h5(input_dir, h5_filename, device="cuda", skip_cache=F
     filenames = collect_filenames_from_dirs(sub_dirs)
     uniprot_to_filenames, unique_uniprots = build_uniprot_to_filenames(filenames)
 
-    # Intermediate file for streaming embeddings
-    embeddings_h5_path = os.path.join(input_dir, "uniprot_embeddings_temp.h5")
+    # Intermediate file for streaming embeddings (model- and layer-specific so
+    # different models/layers don't reuse each other's cache). The 600M prefix is
+    # left empty to preserve the existing cache filenames
+    # (uniprot_embeddings_temp_final.h5 / _layer27.h5).
+    model_tag = "" if model_name == "esmc_600m" else f"{model_name.replace('esmc_', '')}_"  # e.g. "6b_"
+    cache_suffix = "final" if esm_layer < 0 else f"layer{esm_layer}"
+    embeddings_h5_path = os.path.join(input_dir, f"uniprot_embeddings_temp_{model_tag}{cache_suffix}.h5")
     
     if skip_cache and os.path.exists(embeddings_h5_path):
         print(f"Skipping cache: removing existing embeddings file {embeddings_h5_path}")
@@ -486,7 +579,7 @@ def add_esm_embeddings_to_h5(input_dir, h5_filename, device="cuda", skip_cache=F
     
     if not os.path.exists(embeddings_h5_path):
         # Stream embeddings to disk instead of keeping in memory
-        fetch_and_embed_sequences(unique_uniprots, embeddings_h5_path, device=device)
+        fetch_and_embed_sequences(unique_uniprots, embeddings_h5_path, device=device, esm_layer=esm_layer, model_name=model_name)
     else:
         print(f"Intermediate embeddings file already exists: {embeddings_h5_path}")
     
@@ -542,7 +635,24 @@ def main():
         action="store_true",
         help="Skip cache and force regeneration of embeddings even if cached file exists"
     )
-    
+    parser.add_argument(
+        "--esm_layer",
+        type=int,
+        default=-1,
+        help="ESM-C hidden layer to extract (0=embedding, 1..N=after each block). "
+             "-1 = final post-norm embeddings (original behavior, default). "
+             "Use e.g. 27 (~3/4 depth) for esmc_600m, or 60 for esmc_6b."
+    )
+    parser.add_argument(
+        "--esm_model",
+        type=str,
+        default="esmc_600m",
+        choices=["esmc_600m", "esmc_300m", "esmc_6b"],
+        help="ESM-C checkpoint (default: esmc_600m, 1152-dim). esmc_600m/300m load via "
+             "the esm package; esmc_6b (2560-dim) loads from HuggingFace (biohub/ESMC-6B). "
+             "Intermediate cache files are namespaced by model."
+    )
+
     args = parser.parse_args()
 
     write_localization_category_to_h5(
@@ -555,7 +665,9 @@ def main():
         input_dir=args.input_dir,
         h5_filename=args.h5_filename,
         device=args.device,
-        skip_cache=args.skip_cache
+        skip_cache=args.skip_cache,
+        esm_layer=args.esm_layer,
+        model_name=args.esm_model
     )
 
 
