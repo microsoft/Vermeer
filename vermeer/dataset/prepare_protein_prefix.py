@@ -95,7 +95,7 @@ def embed_sequence(seq, device="cuda"):
 
 def extract_mean_representation(protein_embedding):
     """Extract mean representation from protein embedding."""
-    return protein_embedding.squeeze()[1:-1].mean(axis=0)
+    return protein_embedding.squeeze().mean(axis=0)
 
 def get_uniprot_protein_sequence(uniprot_id):
     """Fetch protein sequence from UniProt API."""

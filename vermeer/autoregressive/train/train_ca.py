@@ -649,10 +649,6 @@ def main(args):
             elif args.gpt_type == 'ca_esm_embed_mean_pool':
                 y = y.unsqueeze(1) # TODO: check this shape 
 
-                # print("y shape:", y.shape)
-                # print("z_indices shape:", z_indices.shape)
-                # print("targets shape:", targets.shape)
-
                 with torch.amp.autocast('cuda', dtype=ptdtype):
                     _, loss = model(
                         idx=z_indices,
@@ -660,9 +656,6 @@ def main(args):
                         targets=targets
                     ) 
             elif args.gpt_type == 'ca_esm_embed_full': # TODO: double check this
-                # print("Y shape:", y.shape)
-                # print("z_indices shape:", z_indices.shape)
-                # print("targets shape:", targets.shape)
                 with torch.amp.autocast('cuda', dtype=ptdtype):
                     _, loss = model(
                         idx=z_indices,
