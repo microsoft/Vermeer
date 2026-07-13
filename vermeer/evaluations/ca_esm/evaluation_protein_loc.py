@@ -229,6 +229,7 @@ def load_models(args, device):
         block_size_per_channel=args.block_size_per_channel,
         model_type=args.model_type,
         esm_dim=ESM_MODEL_DIMS[args.esm_model],
+        delimiter_positional_emb=args.delimiter_positional_emb,
     ).to(device=device, dtype=precision)
 
     checkpoint = torch.load(args.model_checkpoint, map_location="cpu", weights_only=False)
@@ -812,6 +813,12 @@ def parse_args():
         default="esmc_600m",
         help="ESM-C model the checkpoint was trained with; sets conditioning input dim "
              "(esmc_600m=1152, esmc_6b=2560). Must match the trained checkpoint."
+    )
+    parser.add_argument(
+        "--delimiter_positional_emb",
+        action='store_true',
+        help="set if the checkpoint was trained with --delimiter-positional-emb "
+             "(adds slot-indexed positional embeddings to SOC/EOC tokens); must match training."
     )
     parser.add_argument(
         "--codebook_size",

@@ -85,7 +85,8 @@ class ModelArgs:
     # Channel-adaptive settings
     n_max_channels: int = 4
     block_size_per_channel: int = 256  # patches per channel (e.g., 16x16=256)
-    
+    delimiter_positional_emb: bool = False  # add learned slot-indexed pos emb to SOC/EOC tokens
+
     token_dropout_p: float = 0.1
     attn_dropout_p: float = 0.0
     resid_dropout_p: float = 0.1
@@ -509,6 +510,14 @@ class Transformer(nn.Module):
         # self.pos_1LC = nn.Parameter(torch.zeros(1, config.max_seq_length, config.dim))
         # nn.init.trunc_normal_(self.pos_1LC, std=config.initializer_range)
 
+        # Delimiter positional embedding: learned, slot-indexed embedding added to
+        # SOC/EOC tokens (the k-th channel boundary gets slot k). Orthogonal to the
+        # 2D RoPE, which gives delimiters a zero positional slot.
+        self.delimiter_positional_emb = config.delimiter_positional_emb
+        if config.delimiter_positional_emb:
+            self.soc_pos_emb = nn.Embedding(config.n_max_channels, config.dim)
+            self.eoc_pos_emb = nn.Embedding(config.n_max_channels, config.dim)
+
         # Transformer blocks
         dpr = [x.item() for x in torch.linspace(0, config.drop_path_rate, config.n_layer)]
         self.layers = torch.nn.ModuleList()
@@ -592,6 +601,48 @@ class Transformer(nn.Module):
             indices.extend([ch + 1] * self.tokens_per_channel)
         return torch.tensor(indices, device=device)
 
+    def _apply_delimiter_pos_emb(self, token_embeddings, idx, input_pos):
+        """Add a learned, slot-indexed positional embedding to SOC/EOC tokens.
+
+        The k-th SOC (resp. EOC) in the sequence receives ``soc_pos_emb.weight[k]``
+        (resp. ``eoc_pos_emb.weight[k]``) — slot-indexed, not channel-identity
+        indexed, so it is invariant to channel permutation and correct under
+        channel dropout (fewer channels -> consecutive slots 0,1,2,...). Patches
+        and EOS get a zero delta.
+
+        Two code paths:
+        - training / prefill (``input_pos is None`` or multi-token ``idx``): the
+          slot is the cumulative count of same-type delimiters seen so far in
+          ``idx`` (which is a contiguous sequence starting at channel 0).
+        - decode (single token + scalar ``input_pos``): the slot is derived from
+          the absolute position as ``(input_pos - cls_token_num) // tokens_per_channel``.
+        """
+        V = self.config.vocab_size
+        C = self.config.n_max_channels
+        is_soc = (idx >= V) & (idx < V + C)
+        is_eoc = (idx >= V + C) & (idx < V + 2 * C)
+
+        if input_pos is not None and idx.shape[1] == 1:
+            # Decode: single new token, derive slot from absolute position.
+            slot = ((input_pos - self.cls_token_num) // self.tokens_per_channel).clamp(0, C - 1)
+            slot = slot.to(idx.device)
+            soc_emb = self.soc_pos_emb(slot).view(1, 1, -1)  # (1, 1, D)
+            eoc_emb = self.eoc_pos_emb(slot).view(1, 1, -1)
+            zero = torch.zeros_like(soc_emb)
+            delta = torch.where(is_soc.unsqueeze(-1), soc_emb, zero)
+            delta = delta + torch.where(is_eoc.unsqueeze(-1), eoc_emb, zero)
+        else:
+            # Training / prefill: slot = cumulative count of same-type delimiter.
+            soc_slot = (torch.cumsum(is_soc.long(), dim=1) - 1).clamp(0, C - 1)
+            eoc_slot = (torch.cumsum(is_eoc.long(), dim=1) - 1).clamp(0, C - 1)
+            soc_emb = self.soc_pos_emb(soc_slot)  # (B, L, D)
+            eoc_emb = self.eoc_pos_emb(eoc_slot)
+            zero = torch.zeros_like(soc_emb)
+            delta = torch.where(is_soc.unsqueeze(-1), soc_emb, zero)
+            delta = delta + torch.where(is_eoc.unsqueeze(-1), eoc_emb, zero)
+
+        return token_embeddings + delta
+
     def forward(
         self, 
         idx: torch.Tensor,
@@ -655,6 +706,8 @@ class Transformer(nn.Module):
 
         if idx is not None and cond_idx is not None: # training or naive inference
             token_embeddings = self.tok_embeddings_extended(idx)
+            if self.delimiter_positional_emb:
+                token_embeddings = self._apply_delimiter_pos_emb(token_embeddings, idx, input_pos)
             # # Add channel number embeddings
             # channel_indices = self.get_channel_indices(self.n_max_channels, idx.device)
             # channel_indices = channel_indices[:idx.shape[1]].unsqueeze(0).expand(idx.shape[0], -1)
@@ -670,7 +723,9 @@ class Transformer(nn.Module):
                 token_embeddings = cond_embeddings
             else: # decode_n_tokens(kv cache) in inference
                 token_embeddings = self.tok_embeddings_extended(idx)
-            
+                if self.delimiter_positional_emb:
+                    token_embeddings = self._apply_delimiter_pos_emb(token_embeddings, idx, input_pos)
+
             bs = token_embeddings.shape[0]
             mask = self.causal_mask[:bs, None, input_pos]
             h = self.tok_dropout(token_embeddings)

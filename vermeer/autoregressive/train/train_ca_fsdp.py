@@ -329,6 +329,7 @@ def main(args):
         drop_path_rate=args.drop_path_rate,
         token_dropout_p=args.token_dropout_p,
         pretrained_gpt=pretrained_gpt,
+        delimiter_positional_emb=args.delimiter_positional_emb,
     ).to(device)
     logger.info(f"GPT-CA Parameters: {sum(p.numel() for p in model.parameters()):,}")
     logger.info(f"Model config: n_max_channels={args.n_channels}, block_size_per_channel={block_size_per_channel}")
@@ -691,6 +692,9 @@ if __name__ == "__main__":
     parser.add_argument("--gpt-model", type=str, choices=list(GPT_models.keys()), default="GPT-B")
     parser.add_argument("--gpt-resume", type=str, default=None, help="checkpoint directory for resume training (contains consolidated.pth + optimizer shards)")
     parser.add_argument("--gpt-type", type=str, choices=['ca', 'ca_binary_prefix', 'ca_esm_embed_mean_pool', 'ca_esm_embed_full'], default="ca", help="type of conditioning")
+    parser.add_argument("--delimiter-positional-emb", action='store_true',
+                        help="add a learned, slot-indexed positional embedding to SOC/EOC delimiter tokens. "
+                             "Must be passed identically at eval/generation time to load a checkpoint trained with it.")
     parser.add_argument("--vocab-size", type=int, default=16384, help="vocabulary size of visual tokenizer")
     parser.add_argument("--pretrained-gpt-ckpt", type=str, default=None, help="pretrained GPT model checkpoint path (loaded on rank 0 before FSDP wrapping)")
     parser.add_argument("--ema", action='store_true', help="NOT SUPPORTED with FSDP - will raise error")
