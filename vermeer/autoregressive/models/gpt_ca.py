@@ -97,6 +97,7 @@ class ModelArgs:
     num_classes: int = 1000
     caption_dim: int = 2048
     esm_dim: int = 1152  # conditioning embedding width (esmc_600m=1152, esmc_6b=2560)
+    num_proteins: int = 0  # size of learnable protein table (ca_learnable_protein_embed)
     class_dropout_prob: float = 0.1
     model_type: str = 'ca'
 
@@ -217,6 +218,42 @@ class MLP(nn.Module):
         x = self.act(x)
         x = self.fc2(x)
         return x
+
+
+class ProteinLookupEmbedder(nn.Module):
+    """
+    Learnable per-protein embedding table indexed by an integer protein id, then
+    projected to model dim by MLP projector.
+
+    The table has num_proteins + 1 rows; including a learnable null / unconditional protein,
+    used for classifier-free guidance
+
+    Input ids: (B,) long. Output: (B, 1, dim).
+    """
+    def __init__(self, num_proteins, hidden_size, in_channels, dropout_prob):
+        super().__init__()
+        self.num_proteins = num_proteins  # null id == num_proteins
+        self.dropout_prob = dropout_prob
+        self.embedding_table = nn.Embedding(num_proteins + 1, in_channels)  # +1 null row
+        self.proj = MLP(in_features=in_channels, hidden_features=hidden_size, out_features=hidden_size)
+
+    def token_drop(self, ids, force_drop_ids=None):
+        """Drops protein ids to the learnable null id to enable classifier-free guidance."""
+        if force_drop_ids is None:
+            drop_ids = torch.rand(ids.shape[0], device=ids.device) < self.dropout_prob
+        else:
+            drop_ids = force_drop_ids == 1
+        return torch.where(drop_ids, torch.full_like(ids, self.num_proteins), ids)
+
+    def forward(self, ids, train, force_drop_ids=None):
+        # ids: (B,) long
+        use_dropout = self.dropout_prob > 0
+        if (train and use_dropout) or (force_drop_ids is not None):
+            ids = self.token_drop(ids, force_drop_ids)
+        emb = self.embedding_table(ids)   # (B, in_channels)
+        emb = self.proj(emb)              # (B, dim)
+        return emb.unsqueeze(1)           # (B, 1, dim)
+
 
 #################################################################################
 #                      Embedding Layers for full ESM embedding                  #
@@ -487,6 +524,14 @@ class Transformer(nn.Module):
             # input esm is [AA, esm_dim]
             # self.cls_embedding = ESMConvPoolEmbedder(esm_dim, config.dim, config.class_dropout_prob, token_num=self.cls_token_num)
             self.cls_embedding = ESMAttentionPoolEmbedder(esm_dim, config.dim, config.class_dropout_prob, token_num=self.cls_token_num)
+        elif self.model_type == 'ca_learnable_protein_embed':
+            assert config.num_proteins > 0, "num_proteins must be set for ca_learnable_protein_embed"
+            self.cls_embedding = ProteinLookupEmbedder(
+                num_proteins=config.num_proteins,
+                hidden_size=config.dim,
+                in_channels=config.esm_dim,  # embedding-table width (reuses esm projector shape)
+                dropout_prob=config.class_dropout_prob,
+            )
         else:
             raise ValueError(f"Unsupported model type: {self.model_type}")
         
@@ -701,6 +746,10 @@ class Transformer(nn.Module):
                     cond_embeddings = self.cls_embedding(cond_idx, train=self.training)[:,:self.cls_token_num]
                     # print("cond_embeddings shape:", cond_embeddings.shape)
                 # print("cond_embeddings shape:", cond_embeddings.shape)
+            elif self.model_type == 'ca_learnable_protein_embed':
+                # cond_idx: (B, 1) or (B,) long protein ids
+                ids = cond_idx.squeeze(1) if cond_idx.dim() > 1 else cond_idx
+                cond_embeddings = self.cls_embedding(ids.long(), train=self.training)[:, :self.cls_token_num]
             else: # conditional case
                 raise NotImplementedError("Conditional generation is not implemented for CA model")
 

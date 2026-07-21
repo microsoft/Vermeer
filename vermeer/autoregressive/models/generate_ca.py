@@ -194,10 +194,15 @@ def generate(model, cond, max_new_tokens, emb_masks=None, cfg_scale=1.0, cfg_int
         else:
             cond_combined = cond
     elif model.model_type == 'ca_esm_embed_full':
-        # raise NotImplementedError("generation not implemented for CA_esm_embed_full model")
-        ## TODO: finish testing this
         if cfg_scale > 1.0:
             cond_null = torch.zeros_like(cond) + model.cls_embedding.uncond_embedding
+            cond_combined = torch.cat([cond, cond_null])
+        else:
+            cond_combined = cond
+    elif model.model_type == 'ca_learnable_protein_embed':
+        # cond is (N, 1) long protein ids; null branch uses the learnable null id.
+        if cfg_scale > 1.0:
+            cond_null = torch.full_like(cond, model.cls_embedding.num_proteins)
             cond_combined = torch.cat([cond, cond_null])
         else:
             cond_combined = cond
@@ -289,13 +294,22 @@ def generate_with_prefix(
             # raise NotImplementedError("CFG is not implemented for CA_esm_embed_full model")
             cond_null = torch.zeros_like(cond_idx) + model.cls_embedding.uncond_embedding
             cond_combined = torch.cat([cond_idx, cond_null])
-            prefix_combined = torch.cat([prefix_tokens, prefix_tokens]) # duplicate prefix tokens for cfg 
+            prefix_combined = torch.cat([prefix_tokens, prefix_tokens]) # duplicate prefix tokens for cfg
+        else:
+            cond_combined = cond_idx
+            prefix_combined = prefix_tokens
+    elif model.model_type == 'ca_learnable_protein_embed':
+        # cond_idx is (N, 1) long protein ids; null branch uses the learnable null id.
+        if cfg_scale > 1.0:
+            cond_null = torch.full_like(cond_idx, model.cls_embedding.num_proteins)
+            cond_combined = torch.cat([cond_idx, cond_null])
+            prefix_combined = torch.cat([prefix_tokens, prefix_tokens])  # duplicate prefix tokens for cfg
         else:
             cond_combined = cond_idx
             prefix_combined = prefix_tokens
     else:
         raise Exception("please check model type")
-    
+
     # Calculate sequence lengths
     # Total tokens = n_total_channels * tokens_per_channel + 1 (EOS)
     total_tokens = n_total_channels * tokens_per_channel + 1

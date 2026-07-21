@@ -20,6 +20,7 @@ import os
 import time
 import inspect
 import argparse
+import json
 
 import collections
 import wandb
@@ -293,7 +294,15 @@ def eval_ep(model, val_loader, val_loss, val_steps, device, args, ptdtype):
                         non_mask=np_mask,
                         lens=lens
                     )
-            
+            elif args.gpt_type == 'ca_learnable_protein_embed':
+                # y: (B,) long protein ids -> (B, 1)
+                with torch.amp.autocast('cuda', dtype=ptdtype):
+                    _, loss = model(
+                        idx=z_indices,
+                        cond_idx=y.long().unsqueeze(1),
+                        targets=targets
+                    )
+
             val_loss += loss.item()
             val_steps += 1
 
@@ -454,12 +463,22 @@ def main(args):
         pretrained_gpt = True
     else:
         pretrained_gpt = False
-    
+
+    # Learnable per-protein embedding: derive the table size from the vocab bundle.
+    if args.gpt_type == 'ca_learnable_protein_embed':
+        assert args.protein_vocab is not None, \
+            "ca_learnable_protein_embed requires --protein-vocab (vocab bundle dir)"
+        with open(os.path.join(args.protein_vocab, 'uniprot_to_index.json')) as f:
+            args.num_proteins = len(json.load(f))
+        logger.info(f"ca_learnable_protein_embed: num_proteins={args.num_proteins} "
+                    f"(from {args.protein_vocab})")
+
     model = GPT_models[args.gpt_model](
         vocab_size=args.vocab_size,
         block_size_per_channel=block_size_per_channel,
         n_max_channels=n_max_channels_for_model,
         num_classes=args.num_classes,
+        num_proteins=args.num_proteins,
         cls_token_num=args.cls_token_num,
         model_type=args.gpt_type,
         esm_dim=ESM_MODEL_DIMS[args.esm_model],
@@ -750,6 +769,14 @@ def main(args):
                         non_mask=np_mask,
                         lens=lens
                     )
+            elif args.gpt_type == 'ca_learnable_protein_embed':
+                # y: (B,) long protein ids -> (B, 1)
+                with torch.amp.autocast('cuda', dtype=ptdtype):
+                    _, loss = model(
+                        idx=z_indices,
+                        cond_idx=y.long().unsqueeze(1),
+                        targets=targets
+                    )
             else:
                 raise ValueError(f"Unsupported model type: {args.gpt_type}")
             # TODO: add support for esm_embed_full and localization_onehot, deprecate binary prefix
@@ -885,7 +912,13 @@ if __name__ == "__main__":
              "Format 'p:f,p:f' e.g. '0:0,1:1,2:4' (pretrained channel : finetuned channel). "
              "Unlisted finetuned channels keep fresh init. If omitted and channel counts differ, "
              "an identity overlap map (channels 0..min(ckpt,model)-1) is applied automatically.")
-    parser.add_argument("--gpt-type", type=str, choices=['ca', 'ca_binary_prefix', 'ca_esm_embed_mean_pool', 'ca_esm_embed_full'], default="ca", help="type of conditioning")
+    parser.add_argument("--gpt-type", type=str, choices=['ca', 'ca_binary_prefix', 'ca_esm_embed_mean_pool', 'ca_esm_embed_full', 'ca_learnable_protein_embed'], default="ca", help="type of conditioning")
+    parser.add_argument("--protein-vocab", type=str, default=None,
+                        help="path to the protein vocab bundle dir (built by dataset/build_protein_vocab.py); "
+                             "required for --gpt-type ca_learnable_protein_embed. Sets num_proteins.")
+    parser.add_argument("--num-proteins", type=int, default=0,
+                        help="size of the learnable protein embedding table (ca_learnable_protein_embed); "
+                             "auto-filled from --protein-vocab when 0.")
     parser.add_argument("--esm-model", type=str, choices=list(ESM_MODEL_DIMS.keys()), default="esmc_600m",
                         help="ESM-C model used to generate the conditioning embeddings; sets the "
                              "conditioning input dim (esmc_600m=1152, esmc_6b=2560). Must match the "
@@ -924,6 +957,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=24)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=5000)
+    parser.add_argument("--no-local-save", action='store_true', help="Skip saving checkpoints to the local checkpoint dir")
     parser.add_argument("--val-every", type=int, default=5000)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--mixed-precision", type=str, default='bf16', choices=["none", "fp16", "bf16"])

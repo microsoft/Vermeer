@@ -28,6 +28,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "../.."))
 
 from tokenizer.tokenizer_image.vq_model import VQ_models
 from autoregressive.models.gpt_ca import GPT_models, ESM_MODEL_DIMS, assert_esm_model_match
+from dataset.protein_vocab import ProteinVocab
 from autoregressive.models.generate_ca import (
     generate,
     generate_with_prefix,
@@ -59,6 +60,7 @@ def load_models(args, device):
         block_size_per_channel=args.block_size_per_channel,
         model_type=args.model_type,
         esm_dim=ESM_MODEL_DIMS[args.esm_model],
+        num_proteins=getattr(args, "num_proteins", 0),
         delimiter_positional_emb=args.delimiter_positional_emb,
     ).to(device=device, dtype=precision)
 
@@ -205,6 +207,12 @@ def parse_args():
     parser.add_argument("--vq_model", type=str, default="VQ-16")
     parser.add_argument("--gpt_model", type=str, default="GPT-B")
     parser.add_argument("--model_type", type=str, default="ca_esm_embed_mean_pool")
+    parser.add_argument("--protein_vocab", type=str, default=None,
+                        help="path to the protein vocab bundle dir (dataset/build_protein_vocab.py); "
+                             "required for --model_type ca_learnable_protein_embed. Sets num_proteins.")
+    parser.add_argument("--num_proteins", type=int, default=0,
+                        help="size of the learnable protein embedding table (ca_learnable_protein_embed); "
+                             "auto-filled from --protein_vocab when 0.")
     parser.add_argument("--esm_model", type=str, default="esmc_600m",
                         choices=list(ESM_MODEL_DIMS.keys()),
                         help="ESM model whose embedding width the checkpoint was trained with "
@@ -285,6 +293,16 @@ def main():
 
     if len(missing) < len(filenames):
         print(f"\n{len(filenames) - len(missing)}/{len(filenames)} samples already exist. Generating remaining {len(missing)}.")
+
+    # Learnable per-protein embedding: load the vocab bundle (maps UniProt id -> index,
+    # with nearest-neighbor fallback for unseen proteins) and derive num_proteins.
+    protein_vocab = None
+    if args.model_type == "ca_learnable_protein_embed":
+        assert args.protein_vocab is not None, \
+            "ca_learnable_protein_embed requires --protein_vocab (vocab bundle dir)"
+        protein_vocab = ProteinVocab(args.protein_vocab)
+        args.num_proteins = protein_vocab.num_proteins
+        print(f"Loaded protein vocab: num_proteins={args.num_proteins} (from {args.protein_vocab})")
 
     # Load models
     vq_model, gpt_model = load_models(args, device)
@@ -369,12 +387,21 @@ def main():
                 padding_mask = padding_mask.to(device)
             if lens is not None:
                 lens = lens.to(device)
+        elif args.model_type == "ca_learnable_protein_embed":
+            # Resolve each image's protein to a train index (NN in ESM space for unseen).
+            ids = [protein_vocab.index_for(os.path.basename(fn).split('_')[0], esm_vec=lab)
+                   for fn, lab in zip(batch_filenames, batch_labels)]
+            cond = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(1)  # (N, 1)
+            padding_mask = None
+            lens = None
         else:
             cond = torch.from_numpy(np.stack(batch_labels)).float().unsqueeze(1).to(device)
             padding_mask = None
             lens = None
 
-        cond = cond.to(dtype=next(gpt_model.parameters()).dtype)
+        # ESM modes feed float embeddings (cast to model dtype); learnable mode keeps long ids.
+        if args.model_type != "ca_learnable_protein_embed":
+            cond = cond.to(dtype=next(gpt_model.parameters()).dtype)
 
         if args.generation_mode == "protein_only":
             # Generate protein channel conditioned on landmark stains

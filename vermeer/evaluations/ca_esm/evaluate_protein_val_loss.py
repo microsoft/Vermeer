@@ -106,8 +106,14 @@ def parse_args():
         "--gpt_type",
         type=str,
         default="ca_esm_embed_mean_pool",
-        choices=["ca", "ca_binary_prefix", "ca_esm_embed_mean_pool", "ca_esm_embed_full"],
+        choices=["ca", "ca_binary_prefix", "ca_esm_embed_mean_pool", "ca_esm_embed_full", "ca_learnable_protein_embed"],
     )
+    parser.add_argument("--protein_vocab", type=str, default=None,
+                        help="path to the protein vocab bundle dir (dataset/build_protein_vocab.py); "
+                             "required for --gpt_type ca_learnable_protein_embed. Sets num_proteins.")
+    parser.add_argument("--num_proteins", type=int, default=0,
+                        help="size of the learnable protein embedding table (ca_learnable_protein_embed); "
+                             "auto-filled from --protein_vocab when 0.")
     parser.add_argument(
         "--esm_model",
         type=str,
@@ -297,12 +303,20 @@ def load_gpt_model(args, device, ptdtype):
             f"Unknown gpt_model={args.gpt_model}. Available: {list(GPT_models.keys())}"
         )
 
+    # Learnable per-protein embedding: derive the table size from the vocab bundle.
+    if args.gpt_type == "ca_learnable_protein_embed":
+        assert args.protein_vocab is not None, \
+            "ca_learnable_protein_embed requires --protein_vocab (vocab bundle dir)"
+        with open(os.path.join(args.protein_vocab, "uniprot_to_index.json")) as f:
+            args.num_proteins = len(json.load(f))
+
     model_dtype = torch.float32 if ptdtype is None else ptdtype
     model = GPT_models[args.gpt_model](
         vocab_size=args.vocab_size,
         block_size_per_channel=block_size_per_channel,
         n_max_channels=args.n_max_channels,
         num_classes=args.num_classes,
+        num_proteins=args.num_proteins,
         cls_token_num=args.cls_token_num,
         model_type=args.gpt_type,
         esm_dim=ESM_MODEL_DIMS[args.esm_model],
@@ -380,6 +394,12 @@ def forward_logits_for_batch(model, args, z_indices, y, np_mask, lens, autocast_
                 non_mask=np_mask,
                 lens=lens,
             )
+        return logits
+
+    if args.gpt_type == "ca_learnable_protein_embed":
+        # y: (B,) long protein ids -> (B, 1)
+        with autocast_context:
+            logits, _ = model(idx=z_indices, cond_idx=y.long().unsqueeze(1), targets=None)
         return logits
 
     raise ValueError(f"Unsupported gpt_type: {args.gpt_type}")

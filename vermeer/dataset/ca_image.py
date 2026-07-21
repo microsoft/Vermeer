@@ -9,6 +9,8 @@ import os
 from pathlib import Path
 from torch.utils.data import Dataset
 
+from dataset.protein_vocab import ProteinVocab
+
 
 class CACodeDataset(Dataset):
     """
@@ -26,7 +28,8 @@ class CACodeDataset(Dataset):
         label_dir: str,
         vocab_size: int = 16384,
         n_channels: int = 5,
-        model_type: str = 'ca'
+        model_type: str = 'ca',
+        protein_vocab_path: str = None
     ):
         self.feature_dir = feature_dir
         self.label_dir = label_dir
@@ -34,6 +37,14 @@ class CACodeDataset(Dataset):
         self.n_channels = n_channels
         self.flip = 'flip' in self.feature_dir
         self.model_type = model_type
+
+        # Learnable per-protein embedding vocab (ca_learnable_protein_embed)
+        self.protein_vocab = None
+        if model_type == 'ca_learnable_protein_embed':
+            assert protein_vocab_path is not None, \
+                "ca_learnable_protein_embed requires --protein-vocab (vocab bundle dir)"
+            self.protein_vocab = ProteinVocab(protein_vocab_path)
+            self.num_proteins = self.protein_vocab.num_proteins
         # EOS token ID: vocab_size + 2 * n_channels
         self.eos_token_id = vocab_size + 2 * n_channels
         
@@ -91,6 +102,13 @@ class CACodeDataset(Dataset):
             labels_tensor = torch.from_numpy(labels).long()
         elif self.model_type == 'ca_esm_embed_mean_pool' or self.model_type == 'ca_esm_embed_full':
             labels_tensor = torch.from_numpy(labels).float()
+        elif self.model_type == 'ca_learnable_protein_embed':
+            # Map the image's protein to an integer index. Seen (train) proteins use
+            # their own learned row; unseen proteins are resolved to the nearest train
+            # protein by cosine similarity using the ESM mean-pool label as the query.
+            uid = os.path.basename(feature_file).split('_')[0]
+            idx_p = self.protein_vocab.index_for(uid, esm_vec=labels)
+            labels_tensor = torch.tensor(idx_p, dtype=torch.long)  # 0-dim long
         else:
             raise ValueError(f"Invalid model type: {self.model_type}")
 
@@ -113,6 +131,7 @@ def build_ca_code(args, split='train'):
         label_dir=label_dir,
         vocab_size=args.vocab_size,
         n_channels=args.n_channels,
-        model_type=args.gpt_type
+        model_type=args.gpt_type,
+        protein_vocab_path=getattr(args, 'protein_vocab', None)
     )
 
