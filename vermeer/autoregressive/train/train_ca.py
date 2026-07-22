@@ -73,7 +73,109 @@ def compute_anneal_prob(epoch, base_prob, start_epoch, end_epoch):
     return base_prob * (1.0 - frac)
 
 
-def apply_channel_augmentation(features_batch, n_channels, min_channels, tokens_per_channel=258):
+def select_channel_blocks(features_batch, n_channels, channel_order, tokens_per_channel=258,
+                          include_eos=True):
+    """Select channel blocks by original dataset ID and concatenate them in ``channel_order``."""
+    invalid_channels = [ch for ch in channel_order if ch < 0 or ch >= n_channels]
+    if invalid_channels:
+        raise ValueError(
+            f"channel_order contains out-of-range channel IDs: {invalid_channels}. "
+            f"Valid range is [0, {n_channels - 1}]."
+        )
+    if not channel_order:
+        raise ValueError("channel_order must contain at least one channel ID")
+
+    expected_length = n_channels * tokens_per_channel + 1
+    if features_batch.shape[1] != expected_length:
+        raise ValueError(
+            f"Expected {expected_length} tokens for {n_channels} channels, "
+            f"but received {features_batch.shape[1]}."
+        )
+
+    channel_blocks = [
+        features_batch[:, ch * tokens_per_channel:(ch + 1) * tokens_per_channel]
+        for ch in range(n_channels)
+    ]
+    selected_blocks = [channel_blocks[ch] for ch in channel_order]
+    if include_eos:
+        selected_blocks.append(features_batch[:, -1:])
+    return torch.cat(selected_blocks, dim=1)
+
+
+def sample_augmented_channel_order(channel_ids, min_channels, required_channel=None):
+    """
+    Sample one subset and order for a batch, optionally retaining a required channel ID.
+
+    When required_channel is set, place it late enough that truncating after it keeps
+    at least min_channels channels.
+    """
+    channel_ids = list(channel_ids)
+    if not 1 <= min_channels <= len(channel_ids):
+        raise ValueError(
+            f"min_channels ({min_channels}) must be between 1 and the number of available "
+            f"channels ({len(channel_ids)})."
+        )
+    if required_channel is not None and required_channel not in channel_ids:
+        raise ValueError(
+            f"Required channel {required_channel} is not present in available channels {channel_ids}."
+        )
+
+    num_keep = random.randint(min_channels, len(channel_ids))
+    if required_channel is None:
+        return random.sample(channel_ids, num_keep)
+
+    other_channels = [ch for ch in channel_ids if ch != required_channel]
+    selected_others = random.sample(other_channels, num_keep - 1)
+    random.shuffle(selected_others)
+
+    target_position = random.randint(min_channels - 1, num_keep - 1)
+    return (
+        selected_others[:target_position]
+        + [required_channel]
+        + selected_others[target_position:]
+    )
+
+
+def truncate_channel_order_after_target(channel_order, target_channel, tokens_per_channel=258):
+    """Drop causal suffix channels and return the first target patch's target-array offset."""
+    channel_order = list(channel_order)
+    if target_channel not in channel_order:
+        raise ValueError(f"Target channel {target_channel} is not present in order {channel_order}.")
+    target_position = channel_order.index(target_channel)
+    target_start = target_position * tokens_per_channel + 1  # skip the target SOC
+    return channel_order[:target_position + 1], target_start
+
+
+def validate_channel_selection(n_channels, channel_config=None, loss_channel=None):
+    """Validate fixed channel selection and target identity, returning the available IDs."""
+    if n_channels < 1:
+        raise ValueError(f"n_channels must be positive, got {n_channels}.")
+    if loss_channel is not None and not 0 <= loss_channel < n_channels:
+        raise ValueError(
+            f"loss_channel ({loss_channel}) must be an original dataset channel ID in "
+            f"[0, n_channels={n_channels})."
+        )
+
+    available_channels = list(range(n_channels)) if channel_config is None else list(channel_config)
+    if not available_channels:
+        raise ValueError("channel_config must contain at least one channel ID")
+    invalid_channels = [ch for ch in available_channels if ch < 0 or ch >= n_channels]
+    if invalid_channels:
+        raise ValueError(
+            f"channel_config contains out-of-range channel IDs: {invalid_channels}. "
+            f"Valid range is [0, {n_channels - 1}]."
+        )
+    if len(set(available_channels)) != len(available_channels):
+        raise ValueError(f"channel_config contains duplicate channel IDs: {available_channels}.")
+    if loss_channel is not None and loss_channel not in available_channels:
+        raise ValueError(
+            f"loss_channel ({loss_channel}) must be present in channel_config {available_channels}."
+        )
+    return available_channels
+
+
+def apply_channel_augmentation(features_batch, n_channels, min_channels, tokens_per_channel=258,
+                               required_channel=None, channel_ids=None):
     """
     Apply channel reordering/dropout augmentation to a batch of token sequences.
 
@@ -93,27 +195,14 @@ def apply_channel_augmentation(features_batch, n_channels, min_channels, tokens_
     Returns:
         (augmented_features, num_keep): augmented tensor and number of channels kept
     """
-    num_keep = random.randint(min_channels, n_channels)
-    selected_channels = random.sample(range(n_channels), num_keep)
-
-    batch_size = features_batch.shape[0]
-    # Last token is EOS
-    eos_token = features_batch[:, -1:]  # (B, 1)
-
-    # Split into channel blocks (excluding EOS)
-    channel_blocks = []
-    for ch_idx in range(n_channels):
-        start = ch_idx * tokens_per_channel
-        end = start + tokens_per_channel
-        channel_blocks.append(features_batch[:, start:end])  # (B, tokens_per_channel)
-
-    # Select and reorder blocks
-    selected_blocks = [channel_blocks[ch] for ch in selected_channels]
-
-    # Concatenate selected blocks + EOS
-    augmented = torch.cat(selected_blocks + [eos_token], dim=1)
-
-    return augmented, num_keep
+    available_channels = range(n_channels) if channel_ids is None else channel_ids
+    selected_channels = sample_augmented_channel_order(
+        available_channels, min_channels, required_channel=required_channel
+    )
+    augmented = select_channel_blocks(
+        features_batch, n_channels, selected_channels, tokens_per_channel, include_eos=True
+    )
+    return augmented, len(selected_channels)
 
 
 def apply_channel_config(features_batch, n_channels, channel_config, tokens_per_channel=258):
@@ -128,34 +217,23 @@ def apply_channel_config(features_batch, n_channels, channel_config, tokens_per_
     Returns:
         (selected_features, len(channel_config))
     """
-    if channel_config is None or len(channel_config) == 0:
-        raise ValueError("channel_config must contain at least one channel index")
-    invalid_channels = [ch for ch in channel_config if ch < 0 or ch >= n_channels]
-    if invalid_channels:
-        raise ValueError(
-            f"channel_config contains out-of-range channel indices: {invalid_channels}. "
-            f"Valid range is [0, {n_channels - 1}] for n_channels={n_channels}."
-        )
-
-    eos_token = features_batch[:, -1:]
-    channel_blocks = []
-    for ch_idx in range(n_channels):
-        start = ch_idx * tokens_per_channel
-        end = start + tokens_per_channel
-        channel_blocks.append(features_batch[:, start:end])
-    selected_blocks = [channel_blocks[ch] for ch in channel_config]
-    return torch.cat(selected_blocks + [eos_token], dim=1), len(channel_config)
+    validate_channel_selection(n_channels, channel_config=channel_config)
+    selected = select_channel_blocks(
+        features_batch, n_channels, channel_config, tokens_per_channel, include_eos=True
+    )
+    return selected, len(channel_config)
 
 
 def make_collate_fn(channel_augment=False, min_channels=2, channel_augment_prob=0.5,
                     n_channels=4, tokens_per_channel=258, channel_config=None,
-                    prob_state=None):
+                    prob_state=None, loss_channel=None):
     """
     Factory function that returns a collate callable with augmentation config captured.
 
     Args:
         channel_augment: bool, whether to enable channel reordering/dropout
-        min_channels: int, minimum channels to keep when augmenting
+        min_channels: int, minimum channels to keep when augmenting. With
+            loss_channel set, this minimum applies after truncating after the target.
         channel_augment_prob: float, fixed probability of applying augmentation per batch
             (used when prob_state is None)
         n_channels: int, number of channels in the dataset
@@ -166,7 +244,13 @@ def make_collate_fn(channel_augment=False, min_channels=2, channel_augment_prob=
             NOTE: this relies on DataLoader workers being re-forked each epoch
             (persistent_workers=False, the default). If persistent_workers is ever enabled on
             the train loader, the annealed value would freeze at the first epoch's value.
+        loss_channel: optional original dataset channel ID. When set, channels after the target
+            are removed and ``target_start`` identifies the first target patch to score.
     """
+    available_channels = validate_channel_selection(
+        n_channels, channel_config=channel_config, loss_channel=loss_channel
+    )
+
     def collate_fn(batch):
         """
         Custom collate function for CA dataset with optional channel augmentation.
@@ -179,6 +263,7 @@ def make_collate_fn(channel_augment=False, min_channels=2, channel_augment_prob=
         n_channels_out: int # number of channels (possibly reduced by augmentation)
         padding_mask: (B, seq_len) # True for real tokens, False for padding
         lens: (B,) # length of each sequence
+        target_start: optional int # first target patch offset in features/targets
         """
         features = torch.stack([item[0] for item in batch])
         labels_list = [item[1] for item in batch]
@@ -189,18 +274,26 @@ def make_collate_fn(channel_augment=False, min_channels=2, channel_augment_prob=
                 "Check dataset configuration and training arguments."
             )
 
-        # Apply deterministic channel config if set (before channel augmentation)
-        if channel_config is not None:
-            features, n_channels_batch = apply_channel_config(
-                features, n_channels_batch, channel_config, tokens_per_channel
-            )
-
-        # Apply channel augmentation if enabled
+        channel_order = list(available_channels)
         cur_prob = prob_state[0] if prob_state is not None else channel_augment_prob
         if channel_augment and random.random() < cur_prob:
-            features, n_channels_batch = apply_channel_augmentation(
-                features, n_channels_batch, min_channels, tokens_per_channel
+            channel_order = sample_augmented_channel_order(
+                channel_order, min_channels, required_channel=loss_channel
             )
+
+        target_start = None
+        include_eos = True
+        if loss_channel is not None:
+            channel_order, target_start = truncate_channel_order_after_target(
+                channel_order, loss_channel, tokens_per_channel
+            )
+            include_eos = False
+
+        features = select_channel_blocks(
+            features, n_channels_batch, channel_order, tokens_per_channel,
+            include_eos=include_eos,
+        )
+        n_channels_batch = len(channel_order)
 
         # Check if labels have variable shapes (ca_esm_embed_full case)
         if len(labels_list[0].shape) > 1:  # Multi-dimensional labels (e.g., (#AA, embed_dim))
@@ -232,12 +325,12 @@ def make_collate_fn(channel_augment=False, min_channels=2, channel_augment_prob=
             labels = torch.stack(padded_labels)
             lens = torch.tensor(lens)
 
-            return features, labels, n_channels_batch, padding_mask, lens
+            return features, labels, n_channels_batch, padding_mask, lens, target_start
         else:
             # For ca, ca_binary_prefix, or ca_esm_embed_mean_pool: labels are already same shape (e.g., scalar or fixed-length)
             labels = torch.stack(labels_list)
 
-            return features, labels, n_channels_batch, None, None
+            return features, labels, n_channels_batch, None, None, target_start
 
     return collate_fn
 
@@ -250,15 +343,17 @@ def make_collate_fn(channel_augment=False, min_channels=2, channel_augment_prob=
 
 def eval_ep(model, val_loader, val_loss, val_steps, device, args, ptdtype):
     with torch.no_grad():
-        for z_with_eos, y, n_channels, np_mask, lens in val_loader:
+        for z_with_eos, y, n_channels, np_mask, lens, target_start in val_loader:
             z_with_eos = z_with_eos.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
+            if args.gpt_type in ('ca_esm_embed_mean_pool', 'ca_esm_embed_full') and torch.isnan(y).any():
+                raise ValueError("conditioning batch contains nans")
             if np_mask is not None:
                 np_mask = np_mask.to(device, non_blocking=True)
                 lens = lens.to(device, non_blocking=True)
             # Input: all tokens except last
             z_indices = z_with_eos[:, :-1]
-            # Targets: all tokens including last token (EOS)
+            # Targets include the final EOS normally, or end at the target EOC in target-only mode.
             targets = z_with_eos
 
             if args.gpt_type == 'ca':
@@ -267,14 +362,16 @@ def eval_ep(model, val_loader, val_loss, val_steps, device, args, ptdtype):
                     _, loss = model(
                         idx=z_indices,
                         cond_idx=torch.zeros((z_indices.shape[0], 1), device=device, dtype=torch.long), # TODO: is torch.long correct? vs ptdtype?
-                        targets=targets
+                        targets=targets,
+                        target_start=target_start,
                     )
             elif args.gpt_type == 'ca_binary_prefix':
                 with torch.amp.autocast('cuda', dtype=ptdtype):
                     _, loss = model(
                         idx=z_indices,
                         cond_idx=y,
-                        targets=targets
+                        targets=targets,
+                        target_start=target_start,
                     )
             elif args.gpt_type == 'ca_esm_embed_mean_pool':
                 y = y.unsqueeze(1) # TODO: check this shape 
@@ -283,7 +380,8 @@ def eval_ep(model, val_loader, val_loss, val_steps, device, args, ptdtype):
                     _, loss = model(
                         idx=z_indices,
                         cond_idx=y,
-                        targets=targets
+                        targets=targets,
+                        target_start=target_start,
                     )
             elif args.gpt_type == 'ca_esm_embed_full':
                 with torch.amp.autocast('cuda', dtype=ptdtype):
@@ -292,7 +390,8 @@ def eval_ep(model, val_loader, val_loss, val_steps, device, args, ptdtype):
                         cond_idx=y,
                         targets=targets,
                         non_mask=np_mask,
-                        lens=lens
+                        lens=lens,
+                        target_start=target_start,
                     )
             elif args.gpt_type == 'ca_learnable_protein_embed':
                 # y: (B,) long protein ids -> (B, 1)
@@ -300,7 +399,8 @@ def eval_ep(model, val_loader, val_loss, val_steps, device, args, ptdtype):
                     _, loss = model(
                         idx=z_indices,
                         cond_idx=y.long().unsqueeze(1),
-                        targets=targets
+                        targets=targets,
+                        target_start=target_start,
                     )
 
             val_loss += loss.item()
@@ -439,13 +539,16 @@ def main(args):
     selected_n_channels = args.n_channels
     if args.channel_config is not None:
         channel_config = [int(x) for x in args.channel_config.split(',')]
-        assert all(0 <= c < args.n_channels for c in channel_config), \
-            f"channel_config indices {channel_config} must be in [0, n_channels={args.n_channels})"
+        validate_channel_selection(
+            args.n_channels, channel_config=channel_config, loss_channel=args.loss_channel
+        )
         selected_n_channels = len(channel_config)
         logger.info(
             f"channel_config={channel_config} → using {selected_n_channels} selected channels "
             f"(dataset/model n_max_channels={n_max_channels_for_model})"
         )
+    else:
+        validate_channel_selection(args.n_channels, loss_channel=args.loss_channel)
 
     # Setup model
     if args.drop_path_rate > 0.0:
@@ -520,6 +623,16 @@ def main(args):
 
     # Setup data:
     tokens_per_channel = (args.image_size // args.downsample_size) ** 2 + 2  # e.g., 258 for 256x256 with 16x downsample
+    if args.loss_channel is not None:
+        validation_order = channel_config if channel_config is not None else list(range(args.n_channels))
+        validation_order, validation_target_start = truncate_channel_order_after_target(
+            validation_order, args.loss_channel, tokens_per_channel
+        )
+        logger.info(
+            f"Target-channel loss enabled: original channel ID={args.loss_channel}, "
+            f"scored_tokens={block_size_per_channel + 1} (patches + EOC), "
+            f"validation_order={validation_order}, target_start={validation_target_start}"
+        )
     train_dataset = build_ca_code(args, split='train')
     train_sampler = DistributedSampler(
         train_dataset,
@@ -539,12 +652,14 @@ def main(args):
         tokens_per_channel=tokens_per_channel,
         channel_config=channel_config,
         prob_state=ca_prob_state,
+        loss_channel=args.loss_channel,
     )
     collate_fn_val = make_collate_fn(
         channel_augment=False,
         n_channels=args.n_channels,
         tokens_per_channel=tokens_per_channel,
         channel_config=channel_config,
+        loss_channel=args.loss_channel,
     )
     train_loader = DataLoader(
         train_dataset,
@@ -672,7 +787,13 @@ def main(args):
 
     if not args.no_compile:
         logger.info("compiling the model... (may take several minutes)")
-        if args.channel_augment:
+        if args.channel_augment and args.loss_channel is not None:
+            logger.info(
+                "compiling with dynamic=False for target-channel augmentation; "
+                "Torch will cache one static graph per retained-channel count"
+            )
+            model = torch.compile(model, dynamic=False)
+        elif args.channel_augment:
             logger.info("compiling the model with dynamic=True due to channel augmentation (variable sequence lengths)")
             model = torch.compile(model, dynamic=True) # requires PyTorch 2.0
         else:
@@ -716,7 +837,7 @@ def main(args):
                 args.anneal_ca_start_epoch, args.anneal_ca_end_epoch,
             )
             logger.info(f"[anneal-ca] epoch {epoch}: channel-augment prob = {ca_prob_state[0]:.4f}")
-        for it, (z_with_eos, y, n_channels, np_mask, lens) in enumerate(train_loader): # dataloader adds EOS token
+        for it, (z_with_eos, y, n_channels, np_mask, lens, target_start) in enumerate(train_loader): # dataloader adds EOS token unless target-only loss truncates at EOC
             g_it = epoch * iters_train + it 
 
             # print("g_it:", g_it)
@@ -730,10 +851,12 @@ def main(args):
 
             z_with_eos = z_with_eos.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True) ## todo: inefficient for ca case 
+            if args.gpt_type in ('ca_esm_embed_mean_pool', 'ca_esm_embed_full') and torch.isnan(y).any():
+                raise ValueError("conditioning batch contains nans")
             
             # Input: all tokens except last
             z_indices = z_with_eos[:, :-1]  # (B, seq_len-1)
-            # Targets: all tokens including last token (EOS)
+            # Targets include the final EOS normally, or end at the target EOC in target-only mode.
             targets = z_with_eos  # (B, seq_len)
 
             if args.gpt_type == 'ca':
@@ -742,14 +865,16 @@ def main(args):
                     _, loss = model(
                         idx=z_indices,
                         cond_idx=torch.zeros((z_indices.shape[0], 1), device=device, dtype=torch.long), # TODO: is torch.long correct? vs ptdtype?
-                        targets=targets
+                        targets=targets,
+                        target_start=target_start,
                     )
             elif args.gpt_type == 'ca_binary_prefix':
                 with torch.amp.autocast('cuda', dtype=ptdtype):
                     _, loss = model(
                         idx=z_indices,
                         cond_idx=y,
-                        targets=targets
+                        targets=targets,
+                        target_start=target_start,
                     )
             elif args.gpt_type == 'ca_esm_embed_mean_pool':
                 y = y.unsqueeze(1) # TODO: check this shape 
@@ -758,7 +883,8 @@ def main(args):
                     _, loss = model(
                         idx=z_indices,
                         cond_idx=y,
-                        targets=targets
+                        targets=targets,
+                        target_start=target_start,
                     ) 
             elif args.gpt_type == 'ca_esm_embed_full': # TODO: double check this
                 with torch.amp.autocast('cuda', dtype=ptdtype):
@@ -767,7 +893,8 @@ def main(args):
                         cond_idx=y,
                         targets=targets,
                         non_mask=np_mask,
-                        lens=lens
+                        lens=lens,
+                        target_start=target_start,
                     )
             elif args.gpt_type == 'ca_learnable_protein_embed':
                 # y: (B,) long protein ids -> (B, 1)
@@ -775,7 +902,8 @@ def main(args):
                     _, loss = model(
                         idx=z_indices,
                         cond_idx=y.long().unsqueeze(1),
-                        targets=targets
+                        targets=targets,
+                        target_start=target_start,
                     )
             else:
                 raise ValueError(f"Unsupported model type: {args.gpt_type}")
@@ -966,10 +1094,20 @@ if __name__ == "__main__":
     parser.add_argument("--wandb-project", type=str, default="llamagen-ca", help="W&B project name")
     parser.add_argument("--wandb-run-id", type=str, default=None, help="W&B run ID for resuming")
     parser.add_argument("--channel-augment", action='store_true', help="Enable channel reordering/dropout augmentation")
-    parser.add_argument("--min-channels", type=int, default=2, help="Minimum channels to keep when channel augmentation is enabled (default: 2)")
+    parser.add_argument(
+        "--min-channels", type=int, default=2,
+        help=(
+            "Minimum channels to keep when channel augmentation is enabled. "
+            "With --loss-channel, this applies after truncating after the target "
+            "channel (default: 2)."
+        )
+    )
     parser.add_argument("--channel-augment-prob", type=float, default=0.5, help="Probability of applying channel augmentation per batch (default: 0.5)")
     parser.add_argument("--channel-config", type=str, default=None,
         help="Comma-separated channel indices to select and order, e.g. '0,1,3' or '3,0'. Default: use all channels in original order.")
+    parser.add_argument("--loss-channel", type=int, default=None,
+        help="Original dataset channel ID to score exclusively. Prefix channels remain conditioning context; "
+             "the target's patch codes and EOC are scored.")
     parser.add_argument("--anneal-ca", action='store_true',
         help="Linearly anneal channel-augmentation probability to 0 between --anneal-ca-start-epoch "
              "and --anneal-ca-end-epoch, then train with fixed channel order. Requires --channel-augment.")
@@ -979,4 +1117,3 @@ if __name__ == "__main__":
         help="Epoch at which channel-augmentation probability reaches 0 (fixed channel order after this).")
     args = parser.parse_args()
     main(args)
-

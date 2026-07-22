@@ -698,6 +698,7 @@ class Transformer(nn.Module):
         valid: Optional[torch.Tensor] = None,
         non_mask: Optional[torch.Tensor] = None,
         lens: Optional[torch.Tensor] = None,
+        target_start: Optional[int] = None,
     ):
         """
         Forward pass for channel-adaptive GPT.
@@ -712,6 +713,8 @@ class Transformer(nn.Module):
             targets: (B, seq_len) target tokens for loss computation
             mask: optional attention mask
             valid: optional validity mask for loss
+            target_start: optional target-array offset of the first target-channel patch.
+                When provided, only that channel's patches and EOC are projected and scored.
         """
 
         if cond_idx is not None:
@@ -728,7 +731,11 @@ class Transformer(nn.Module):
             elif self.model_type == 'ca_esm_embed_mean_pool' or self.model_type == 'ca_esm_embed_full':
                 ## TODO: fix this in dataloader / extract_codes_ca.py instead 
                 # look for all 0s or nans in cond_idx
-                if torch.isnan(cond_idx).any():
+                # The trainer checks compiled conditioning batches before entering the model.
+                # Retain the direct check for eager training/inference without introducing a
+                # tensor-to-Python graph break (or an unbacked scalar assertion) under Dynamo.
+                #TODO: comment this out for efficiency
+                if not torch.compiler.is_compiling() and torch.isnan(cond_idx).any():
                     raise ValueError("cond_idx contains nans")
                 # Check if any batch element has all zeros across embedding dimension
                 # #TODO: double check this
@@ -789,11 +796,33 @@ class Transformer(nn.Module):
         for layer in self.layers:
             h = layer(h, freqs_cis, input_pos, mask)
         
+        # For target-channel training/validation, retain all prefix computation but project only
+        # the aligned target patch/EOC states. The conditioning prefix shifts hidden-state indices
+        # by cls_token_num - 1 relative to the target array.
+        if target_start is not None:
+            if targets is None:
+                raise ValueError("target_start requires targets")
+            if valid is not None:
+                raise ValueError("target_start cannot be combined with a validity mask")
+            scored_tokens = self.block_size_per_channel + 1  # patches + EOC
+            if not torch.compiler.is_compiling() and target_start != targets.shape[1] - scored_tokens:
+                raise ValueError(
+                    f"target_start={target_start} is not the start of the final {scored_tokens} "
+                    f"target tokens for targets of length {targets.shape[1]}."
+                )
+            # Collation discards EOS and every causal suffix block, so the target patches/EOC
+            # are always the final scored_tokens positions in both aligned arrays. Suffix slicing
+            # avoids specializing the compiled graph on a changing Python target_start value.
+
+            ## assumes that dataloader removes channels after target channel 
+            h = h[:, -scored_tokens:].contiguous()
+            targets = targets[:, -scored_tokens:].contiguous()
+
         # output layers
         h = self.norm(h)
         logits = self.output_extended(h).float()
         
-        if self.training:
+        if self.training and target_start is None:
             logits = logits[:, self.cls_token_num - 1:].contiguous()
 
         # if we are given some desired targets also calculate the loss
