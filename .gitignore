@@ -427,3 +427,7 @@ FodyWeavers.xsd
 *.msix
 *.msm
 *.msp
+
+# vermeer_agent local configuration (cluster-specific paths).
+# vermeer_agent.example.toml is the tracked template.
+vermeer_agent.toml

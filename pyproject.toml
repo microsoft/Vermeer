@@ -8,10 +8,19 @@ version = "0.1.0"
 description = "Vermeer: autoregressive microscopy image generation"
 requires-python = ">=3.10"
 
+# `pip install -e ".[agent]"` adds the stdio MCP server for the vermeer_agent
+# LLM tool layer. The provider-agnostic part of that layer (VERMEER_TOOLS and
+# run_tool) needs nothing beyond the base environment -- its config is TOML,
+# read with the stdlib tomllib.
+[project.optional-dependencies]
+agent = ["mcp>=2.0"]
+dev = ["pytest", "jsonschema"]
+
 # The repo's modules (utils, dataset, autoregressive, ...) live under vermeer/
 # and are imported as top-level packages (e.g. `from utils.logger import ...`).
 # They have no __init__.py, so discover them as PEP 420 namespace packages
-# with vermeer/ as the source root.
+# with vermeer/ as the source root. vermeer_agent/ is the one regular package
+# (it has an __init__.py) and is picked up by the same discovery.
 [tool.setuptools.packages.find]
 where = ["vermeer"]
 namespaces = true

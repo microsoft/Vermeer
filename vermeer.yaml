@@ -40,3 +40,7 @@ dependencies:
       # ESM-C 6B via HuggingFace (dataset/prepare_protein_prefix.py --esm_model esmc_6b: biohub/ESMC-6B)
       - transformers
       - accelerate  # device_map="auto" for loading the 6B checkpoint (optional; code falls back if absent)
+      # stdio MCP server for the vermeer_agent LLM tool layer
+      # (vermeer/vermeer_agent/mcp_server.py). Only needed to expose the tools
+      # over MCP; VERMEER_TOOLS / run_tool work without it.
+      - mcp>=2.0

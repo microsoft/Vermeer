@@ -119,6 +119,60 @@ torchrun \
 
 Evaluation can be run using the evaluation script, `scripts/eval/run_eval_pipeline.sh` and adjusting the necessary path names to point to the correct locations of data and model checkpoints. This wrapper calls several scripts that compute different evaluation  metrics (FID, mean-squared error, etc.). For a more detailed description of the various evaluation metrics, please refer to the preprint. 
 
+## LLM Agent Integration
+
+`vermeer_agent` exports `VERMEER_TOOLS` (standard JSON Schema format) and `run_tool` for use inside any LLM agent loop:
+
+```python
+from vermeer_agent import VERMEER_TOOLS, run_tool, VermeerModel
+
+model = VermeerModel()   # lazy: loads no weights until a tool needs them
+
+# Adapt to your provider (one-liner)
+# Anthropic:  [{"name": t["name"], "description": t["description"], "input_schema": t["parameters"]} for t in VERMEER_TOOLS]
+# OpenAI:     [{"type": "function", "function": t} for t in VERMEER_TOOLS]
+
+# Dispatch tool calls
+result = run_tool(model, tool_name, tool_input)  # returns {"status": "ok"/"error", "message": ..., ...}
+```
+
+Available tools, grouped by cost:
+
+| Tier | Tools |
+| --- | --- |
+| Free (no weights, no GPU) | `list_checkpoints`, `describe_checkpoint`, `list_data_splits`, `search_proteins`, `list_channels`, `lookup_esm_embedding`, `validate_generation_request`, `job_status`, `list_results` |
+| In-process (seconds to minutes, GPU) | `virtual_stain`, `embed_protein`, `compute_metrics` |
+| Batch (returns a SLURM job id) | `submit_generation` |
+
+`virtual_stain` is the flagship task: given the VQ codes of the three reference channels
+(nucleus, microtubule, ER) plus a protein's ESM-C embedding, it generates the protein channel
+and writes `images_true/` and `images_gen/` PNGs that `compute_metrics` consumes directly.
+
+Model shape is read from the checkpoint itself -- `describe_checkpoint` recovers `gpt_model`,
+`model_type`, `esm_model` and `n_max_channels` from the recorded training args, falling back to
+tensor shapes, and reports where each value came from. A tool call therefore needs only a
+checkpoint alias, and no argparse default can silently apply.
+
+### Configuration
+
+Copy `vermeer_agent.example.toml` to `vermeer_agent.toml` and edit the paths (checkpoint
+roots, the VQ tokenizer, code/label datasets, SLURM settings). Every key can also be set with a
+`VERMEER_*` environment variable, which takes precedence. Checkpoints are then referred to by
+short alias -- `452`, `452@0115000`, or a name you define -- rather than by path.
+
+### MCP server
+
+To expose the same tools over MCP (`pip install -e ".[agent]"` first):
+
+```bash
+claude mcp add vermeer \
+  --env LD_LIBRARY_PATH=/path/to/env/lib \
+  --env VERMEER_AGENT_CONFIG=/path/to/Vermeer/vermeer_agent.toml \
+  -- /path/to/env/bin/python -m vermeer_agent.mcp_server
+```
+
+The server registers `VERMEER_TOOLS` generically, so adding a tool needs no change to it.
+
 ## Acknowledgements
 
 Built on [LlamaGen](https://github.com/FoundationVision/LlamaGen). Protein representations from [ESM-C](https://github.com/facebookresearch/esm). Microscopy data from the [Human Protein Atlas](https://www.proteinatlas.org/).
