@@ -94,8 +94,8 @@ def embed_sequence(seq, device="cuda"):
     return protein_embedding.detach().cpu().numpy(), mean_pooled_embedding.detach().cpu().numpy(), cls_token_emb.detach().cpu().numpy()
 
 def extract_mean_representation(protein_embedding):
-    """Extract mean representation from protein embedding."""
-    return protein_embedding.squeeze()[1:-1].mean(axis=0)
+    """Average residue embeddings after CLS and EOS tokens have already been removed."""
+    return protein_embedding.mean(axis=0)
 
 def get_uniprot_protein_sequence(uniprot_id):
     """Fetch protein sequence from UniProt API."""
